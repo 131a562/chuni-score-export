@@ -4,7 +4,7 @@
   'use strict';
 
   const TEST = window.__B50_TEST__ || null;
-  const TEST_DB = { byId: new Map(), byTitle: new Map(), byImage: new Map() };
+  const TEST_DB = (TEST && TEST.db) || { byId: new Map(), byTitle: new Map(), byImage: new Map() };
   const CONST_URL = 'https://raw.githubusercontent.com/zvuc/otoge-db/master/chunithm/data/music-ex.json';
   const HOST = location.hostname;
   const BASE = HOST === 'chunithm-net-eng.com'
@@ -25,7 +25,8 @@
   // 历史记录同步服务（worker/worker.js 部署到 Cloudflare 后的网址）。留空则只保存在本机。
   // otoge-sync：CHUNITHM / オンゲキ / maimai 共用的同步 Worker（见 ../otoge-sync/DEPLOY.md）。
   // 书签请求的 /users/<玩家名> 会被当作 /chunithm/<玩家名>，chuni-sync 时代存在 users/ 下的记录也会自动读到
-  const SYNC_URL = (TEST && TEST.syncUrl) || 'https://otoge-sync.131a562-index01.workers.dev';
+  // 测试模式只用 TEST.syncUrl（未指定则不同步），避免测试数据写进真实的同步服务
+  const SYNC_URL = TEST ? (TEST.syncUrl || '') : 'https://otoge-sync.131a562-index01.workers.dev';
 
   if (document.getElementById('b50-overlay')) document.getElementById('b50-overlay').remove();
 
@@ -710,7 +711,7 @@
     f.appendChild(back);
   }
 
-  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet };
+  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating };
 
   // ---------- 历史走势 ----------
   async function runHistory() {
@@ -740,7 +741,7 @@
     const b1 = document.createElement('button');
     b1.textContent = '生成走势图';
     b1.style.cssText = btnCss + 'background:#c9a2ff;color:#222;margin:4px 8px 12px 0;';
-    b1.onclick = () => run(() => showResult([() => drawTrend(hist, player)], 'chunithm-history'));
+    b1.onclick = () => run(() => showResult([() => drawTrend(hist, player, db)], 'chunithm-history'));
     const back = document.createElement('button');
     back.textContent = '返回菜单';
     back.style.cssText = btnCss + 'background:#ffffff22;color:#fff;margin:4px 0 12px;padding:12px 20px;';
@@ -992,8 +993,107 @@
     return bw;
   }
 
-  function drawTrend(hist, player) {
+  // 某首歌（观测记录的 k / 曲名 / 难度）的定数，查不到时返回 0
+  const constOf = (k, n, d, db) => {
+    const s = enrich({ idx: k.split(':')[0], diff: d, title: n, score: 0 }, db);
+    return { c: s.constant || 0, est: !!s.estimated };
+  };
+
+  // 单曲 Rating 的变化，画在 (x, y) 处右对齐：「Rating 15.42 → 15.67  +0.25」
+  function ratingChange(g, x, y, from, to, cInfo, size) {
+    g.textAlign = 'right';
+    g.font = (size || 14) + 'px ' + FONT;
+    if (!cInfo.c) { g.fillStyle = '#ffffff66'; g.fillText('定数未知', x, y); g.textAlign = 'left'; return; }
+    const r1 = songRating(to, cInfo.c);
+    const r0 = from != null ? songRating(from, cInfo.c) : null;
+    // 用显示出来的两个数（各自截到 0.01）相减，保证差值和左边的数字对得上
+    const cents = (r) => Math.floor(r * 100 + 1e-6);
+    const diff = r0 != null ? cents(r1) - cents(r0) : null;
+    let cx = x;
+    if (diff != null) {
+      g.fillStyle = diff > 0 ? '#7ee0a0' : '#ffffff66'; g.font = 'bold ' + (size || 14) + 'px ' + FONT;
+      const t = diff > 0 ? '+' + (diff / 100).toFixed(2) : '±0.00';
+      g.fillText(t, cx, y);
+      cx -= g.measureText(t).width + 10;
+    }
+    g.fillStyle = '#ffd65a'; g.font = 'bold ' + (size || 14) + 'px ' + FONT;
+    const now = floor2(r1) + (cInfo.est ? '*' : '');
+    g.fillText(now, cx, y);
+    cx -= g.measureText(now).width + 6;
+    g.fillStyle = '#ffffff99'; g.font = (size || 14) + 'px ' + FONT;
+    g.fillText('Rating ' + (r0 != null ? floor2(r0) + ' →' : '→'), cx, y);
+    g.textAlign = 'left';
+  }
+
+  // 推算每次个人最佳更新对账号 Rating 的影响。
+  // 以推分之前最近的快照（当时完整的 BEST 30 / NEW 20）为起点，按时间顺序依次放入每次刷新的分数，
+  // 比较前后的账号 Rating（B50 单曲 Rating 之和 / 50）。经过新的快照时以快照为准重新开始，避免误差累积。
+  function accountImpact(hist, log, db) {
+    const snaps = hist.snaps;
+    const diffOf = (k) => Number(k.slice(k.lastIndexOf(':') + 1));
+    const cache = new Map();
+    const cents = (k, n, s) => {
+      const id = k + '|' + s;
+      if (!cache.has(id)) {
+        const c = constOf(k, n, diffOf(k), db).c;
+        cache.set(id, c ? Math.floor(songRating(s, c) * 100 + 1e-6) : 0);
+      }
+      return cache.get(id);
+    };
+    // 属于 NEW 还是 BEST：先看出现在哪个框的快照里，都没出现过就看版本是否和 NEW 20 的主流版本相同
+    const inNew = new Set(), inBest = new Set();
+    snaps.forEach((s) => { s.news.forEach((e) => inNew.add(e[0])); s.best.forEach((e) => inBest.add(e[0])); });
+    const verCount = {};
+    const latest = snaps[snaps.length - 1];
+    if (latest) latest.news.forEach((e) => { const m = db.byId.get(e[0].split(':')[0]); if (m && m.version) verCount[m.version] = (verCount[m.version] || 0) + 1; });
+    const newVer = Object.keys(verCount).sort((a, b) => verCount[b] - verCount[a])[0];
+    const isNew = (k) => (inNew.has(k) ? true : inBest.has(k) ? false : !!(newVer && (db.byId.get(k.split(':')[0]) || {}).version === newVer));
+
+    const fromSnap = (s) => ({
+      best: new Map(s.best.map((e) => [e[0], { n: e[1], s: e[2] }])),
+      news: new Map(s.news.map((e) => [e[0], { n: e[1], s: e[2] }])),
+    });
+    // 返回 B50 单曲 Rating 之和（单位 0.01）
+    const sum = (st) => [...st.best, ...st.news].reduce((a, [k, v]) => a + cents(k, v.n, v.s), 0);
+    const out = new Map();
+    let si = -1, st = null;
+    log.slice().sort(byTime).forEach((o) => {
+      while (si + 1 < snaps.length && snaps[si + 1].t < o.t) { si++; st = fromSnap(snaps[si]); }
+      if (!st) { out.set(o, null); return; }
+      const before = sum(st);
+      const frame = st.best.has(o.k) ? 'best' : st.news.has(o.k) ? 'news' : (isNew(o.k) ? 'news' : 'best');
+      const list = st[frame], cap = frame === 'best' ? 30 : 20;
+      const wasIn = list.has(o.k);
+      if (!wasIn || o.s > list.get(o.k).s) list.set(o.k, { n: o.n, s: o.s });
+      if (list.size > cap) {
+        // 挤掉框里单曲 Rating 最低的一首（可能就是这首）
+        let low = null, lowC = Infinity;
+        list.forEach((v, k) => { const c = cents(k, v.n, v.s); if (c < lowC || (c === lowC && k === o.k)) { low = k; lowC = c; } });
+        list.delete(low);
+      }
+      const after = sum(st);
+      out.set(o, {
+        frame, entered: !wasIn && list.has(o.k), inB50: list.has(o.k),
+        delta: Math.floor(after / 50) - Math.floor(before / 50), // 账号 Rating 显示值的变化（单位 0.01）
+        exact: (after - before) / 50 / 100,
+      });
+    });
+    return out;
+  }
+
+  // 「进入 BEST 30 · 账号 Rating +0.02」之类的说明文字和颜色
+  const impactText = (im) => {
+    if (!im) return ['之前没有快照，无法推算账号 Rating', '#ffffff55'];
+    const frame = im.frame === 'best' ? 'BEST 30' : 'NEW 20';
+    if (!im.inB50) return ['未进入 ' + frame + '，账号 Rating 不变', '#ffffff66'];
+    const head = im.entered ? '进入 ' + frame + ' · ' : '';
+    if (im.delta > 0) return [head + '账号 Rating +' + (im.delta / 100).toFixed(2), '#7ee0a0'];
+    return [head + '账号 Rating 不变（+' + im.exact.toFixed(4) + '，未进位）', '#ffffff99'];
+  };
+
+  function drawTrend(hist, player, db) {
     const { log } = derive(hist);
+    const impact = accountImpact(hist, log, db);
     const snaps = hist.snaps;
     const last = snaps[snaps.length - 1], prev = snaps[snaps.length - 2];
     // B50 变化
@@ -1009,9 +1109,9 @@
       changes.up = changes.up.slice(0, 10);
     }
     const recent = log.slice(-20).reverse();
-    const ROW = 34;
+    const ROW = 34, PB_ROW = 54;
     const changeRows = Math.max(changes.inn.length + changes.up.length + (changes.upMore ? 1 : 0), changes.out.length, 1);
-    const H = 170 + 460 + 70 + changeRows * ROW + 70 + Math.max(recent.length, 1) * ROW + 60;
+    const H = 170 + 460 + 70 + changeRows * ROW + 70 + Math.max(recent.length, 1) * PB_ROW + 60;
     const { cv, g } = newCanvas(H, HW);
 
     // 头部
@@ -1050,6 +1150,14 @@
 
     // B50 变化
     sectionTitle(g, 'B50 变化' + (prev ? '（对比 ' + prev.t + '）' : ''), y, '#c9a2ff');
+    if (prev) {
+      // 两次快照之间实际的账号 Rating 变化（来自 CHUNITHM-NET 的显示值）
+      const dr = Math.round((last.r - prev.r) * 100);
+      g.textAlign = 'right'; g.font = 'bold 18px ' + FONT;
+      g.fillStyle = dr > 0 ? '#7ee0a0' : dr < 0 ? '#ff8a8a' : '#ffffff88';
+      g.fillText('账号 Rating ' + prev.r.toFixed(2) + ' → ' + last.r.toFixed(2) + '　' + (dr > 0 ? '+' : dr < 0 ? '−' : '±') + (Math.abs(dr) / 100).toFixed(2), HW - PAD, y + 34);
+      g.textAlign = 'left';
+    }
     y += 64;
     const colW = (HW - PAD * 2 - 24) / 2;
     const rowText = (x, yy, e, color, right) => {
@@ -1086,6 +1194,7 @@
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
       g.fillText('暂无记录。プレイ履歴里出现刷新记录、或成绩扫描发现更高分时会记在这里', PAD, y);
     }
+    // 每条两行：上行 日期 / 难度 / 曲名 / 分数变化；下行 单曲 Rating 变化
     recent.forEach((o) => {
       g.fillStyle = '#ffffff88'; g.font = '14px ' + FONT;
       g.fillText(o.t + (o.src === 'b' ? '*' : ''), PAD, y);
@@ -1100,12 +1209,17 @@
       g.fillStyle = '#7ee0a0'; g.font = 'bold 14px ' + FONT;
       g.fillText(o.f != null ? '+' + (o.s - o.f).toLocaleString('en-US') : '', HW - PAD, y);
       g.textAlign = 'left';
-      y += ROW;
+      ratingChange(g, HW - PAD, y + 22, o.f, o.s, constOf(o.k, o.n, o.d, db), 14);
+      const [itext, icolor] = impactText(impact.get(o));
+      g.fillStyle = icolor; g.font = (icolor === '#7ee0a0' ? 'bold ' : '') + '14px ' + FONT;
+      g.fillText(fit(g, itext, HW - PAD * 2 - 150 - 330), PAD + 150, y + 22);
+      g.fillStyle = 'rgba(255,255,255,0.06)'; g.fillRect(PAD, y + 34, HW - PAD * 2, 1);
+      y += PB_ROW;
     });
     const d = new Date();
     g.fillStyle = '#ffffff66'; g.font = '13px ' + FONT;
     g.fillText('Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
-      '  ·  * = 由成绩扫描发现（时间为运行书签的时间）', PAD, H - 20);
+      '  ·  日期后的 * = 由成绩扫描发现（时间为运行书签的时间）  ·  Rating 后的 * = 定数未公开（推定）  ·  Rating 按当前定数计算', PAD, H - 20);
     return cv;
   }
 
@@ -1155,6 +1269,7 @@
     const pbAt = new Map();
     let run = -1;
     obs.forEach((o) => { if (o.src === 'p') pbAt.set(o, run); if (o.s > run) run = o.s; });
+    const cInfo = { c: s.constant || 0, est: !!s.estimated };
     rows.forEach((o) => {
       g.fillStyle = '#ffffff99'; g.font = '15px ' + FONT;
       g.fillText(o.t, PAD, y);
@@ -1163,9 +1278,17 @@
       g.fillStyle = '#ffd65a'; g.font = 'bold 15px ' + FONT;
       g.fillText(scoreRank(o.s), PAD + 330, y);
       const before = pbAt.get(o);
+      const isPB = (before >= 0 && o.s > before) || (before < 0 && o.nr);
       if (before >= 0 && o.s > before) { g.fillStyle = '#7ee0a0'; g.fillText('NEW RECORD  +' + (o.s - before).toLocaleString('en-US'), PAD + 410, y); }
       else if (before < 0 && o.nr) { g.fillStyle = '#7ee0a0'; g.fillText('NEW RECORD', PAD + 410, y); }
       else if (before >= 0) { g.fillStyle = '#ffffff66'; g.font = '14px ' + FONT; g.fillText('距最佳 −' + (before - o.s).toLocaleString('en-US'), PAD + 410, y); }
+      // 单曲 Rating：刷新最佳时显示变化，其他游玩用灰色显示这次分数对应的 Rating
+      if (isPB) ratingChange(g, HW - PAD, y, before >= 0 ? before : null, o.s, cInfo, 15);
+      else if (cInfo.c) {
+        g.textAlign = 'right'; g.fillStyle = '#ffffff66'; g.font = '14px ' + FONT;
+        g.fillText('Rating ' + floor2(songRating(o.s, cInfo.c)), HW - PAD, y);
+        g.textAlign = 'left';
+      }
       y += ROW;
     });
     const d = new Date();
