@@ -23,7 +23,9 @@
     '"PingFang SC","Microsoft YaHei",system-ui,sans-serif';
   const PER_IMAGE = 200;
   // 历史记录同步服务（worker/worker.js 部署到 Cloudflare 后的网址）。留空则只保存在本机。
-  const SYNC_URL = (TEST && TEST.syncUrl) || 'https://chuni-sync.131a562-index01.workers.dev';
+  // otoge-sync：CHUNITHM / オンゲキ / maimai 共用的同步 Worker（见 ../otoge-sync/DEPLOY.md）。
+  // 书签请求的 /users/<玩家名> 会被当作 /chunithm/<玩家名>，chuni-sync 时代存在 users/ 下的记录也会自动读到
+  const SYNC_URL = (TEST && TEST.syncUrl) || 'https://otoge-sync.131a562-index01.workers.dev';
 
   if (document.getElementById('b50-overlay')) document.getElementById('b50-overlay').remove();
 
