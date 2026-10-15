@@ -511,7 +511,12 @@
 
   // ---- 同步（经由 Cloudflare Worker 读写 GitHub 私有仓库的 users/<玩家名>.json）----
   // 「玩家名」= 同步时存入的名字，默认是 CHUNITHM 的玩家名；同一个人换设备时填相同的名字即可接着同步
-  const cleanAccount = (s) => s.trim().replace(/[\\/:*?"<>|#%\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').replace(/^\.+/, '').slice(0, 40);
+  // 统一写法，避免同一个名字因输入方式不同存成两个文件：
+  // NFKC 把全角英数字/符号/空格转成半角、半角片假名转成全角；英文字母统一大写（CHUNITHM 玩家名本来就是大写）
+  const cleanAccount = (s) => s.normalize('NFKC').replace(/[a-z]/g, (c) => c.toUpperCase()).trim()
+    .replace(/[\\/:*?"<>|#%\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').replace(/^\.+/, '').slice(0, 40);
+  // 2026/10/15 的版本没有做上面的统一，名字按原样（多为全角）保存。用于把那时的文件合并过来
+  const legacyAccount = (s) => s.trim().replace(/[\\/:*?"<>|#%\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').replace(/^\.+/, '').slice(0, 40);
   const b64enc = (str) => {
     const bytes = new TextEncoder().encode(str);
     let bin = '';
@@ -642,10 +647,24 @@
       store.set('accounts', accounts);
     }
     if (!acc) { syncNote += '（未开启同步）'; return hist; }
+    // 旧版本保存的名字没有统一全角/半角：改用统一后的名字，并把旧写法文件里的记录合并过来
+    const legacy = [...new Set([acc, legacyAccount(player.name)])].filter((n) => n && n !== cleanAccount(n) && cleanAccount(n) === cleanAccount(acc));
+    if (acc !== cleanAccount(acc)) {
+      acc = cleanAccount(acc);
+      accounts[player.name] = acc;
+      store.set('accounts', accounts);
+    }
+    const migrated = store.get('migrated', []);
+    const pending = legacy.filter((old) => !migrated.includes(old + '>' + acc));
     try {
       say('正在同步…');
+      for (const old of pending) {
+        const { data } = await syncGet(old);
+        if (data && data.obs) hist = mergeHist(data, hist);
+      }
       hist = await syncMerge(acc, hist);
       saveLocalHist(player.name, hist);
+      if (pending.length) store.set('migrated', migrated.concat(pending.map((old) => old + '>' + acc)));
       syncNote = '历史记录已同步（' + acc + '）' + playNote;
     } catch (e) {
       syncNote = '同步失败：' + e.message + '。已保存在本机，下次运行会重试' + playNote;
