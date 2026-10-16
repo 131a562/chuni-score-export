@@ -90,7 +90,8 @@
     const b3 = document.createElement('button');
     b3.textContent = '历史走势';
     b3.style.cssText = btnCss + 'background:#c9a2ff;color:#222;';
-    b3.onclick = () => run(runHistory);
+    // 这次打开书签后读到过数据就直接显示，不重新读取（历史走势页里有「重新读取」）
+    b3.onclick = () => (histView ? showHistoryPanel(histView.hist, histView.player, histView.db) : run(runHistory));
     const b4 = document.createElement('button');
     b4.textContent = '同步账号';
     b4.style.cssText = btnCss + 'background:#ffffff22;color:#fff;padding:8px 20px;font-size:14px;';
@@ -289,7 +290,8 @@
     return out;
   };
 
-  const loadJackets = async (list) => {
+  const loadJackets = async (list, progress) => {
+    progress = progress || say;
     const loadImg = (src) => new Promise((res) => {
       if (!src) return res(null);
       const img = new Image();
@@ -298,7 +300,7 @@
       img.src = src;
     });
     for (let i = 0; i < list.length; i += 8) {
-      say('正在加载曲绘… ' + Math.min(i + 8, list.length) + '/' + list.length);
+      progress('正在加载曲绘… ' + Math.min(i + 8, list.length) + '/' + list.length);
       const batch = list.slice(i, i + 8);
       const imgs = await Promise.all(batch.map((s) => loadImg(s.jacket)));
       imgs.forEach((img, j) => { batch[j].img = img; });
@@ -335,7 +337,7 @@
   async function runB50() {
     const { player, best, news, db } = await readB50();
     if (aborted) return;
-    await recordAndSync({ player, best, news, db });
+    histView = { hist: await recordAndSync({ player, best, news, db }), player, db };
     if (aborted) return;
     await loadJackets([...best, ...news]);
     if (aborted) return;
@@ -382,7 +384,7 @@
       if (!all.length) throw new Error('没有读到成绩。需要开通 CHUNITHM-NET スタンダードコース，或页面结构已变更。');
     }
     const db = TEST ? TEST_DB : await loadConstDb();
-    await recordAndSync({ player, all, db, scanDiffs: opt.diffs });
+    histView = { hist: await recordAndSync({ player, all, db, scanDiffs: opt.diffs }), player, db };
     if (aborted) return;
     const eps = 1e-6;
     let list = all.map((s) => enrich(s, db))
@@ -401,8 +403,9 @@
     const per = Math.ceil(list.length / Math.ceil(list.length / PER_IMAGE));
     const pages = [];
     for (let i = 0; i < list.length; i += per) pages.push(list.slice(i, i + per));
+    // 返回到筛选条件页面（换个定数范围再生成）
     await showResult(pages.map((p, i) => () => drawFilter(player, opt, list, p, i, pages.length, i * per)),
-      'chunithm-' + opt.min.toFixed(1) + '-' + opt.max.toFixed(1));
+      'chunithm-' + opt.min.toFixed(1) + '-' + opt.max.toFixed(1), { label: '返回筛选', fn: showFilterForm });
   }
 
   // ---------- 历史记录 ----------
@@ -419,9 +422,13 @@
   let lastRun = null;     // 最近一次读到的数据，「更改同步名字」「从现在重新开始记录」时复用
 
   const pad2 = (n) => String(n).padStart(2, '0');
+  // 「这次运行」的时间用日本时间：プレイ履歴的时间是日本时间，手机设在别的时区（例：中国时间慢 1 小时）时，
+  // 成绩扫描的时间会排到刚打完的游玩前面，推分就判断错了
   const nowStr = () => {
-    const d = new Date();
-    return d.getFullYear() + '/' + pad2(d.getMonth() + 1) + '/' + pad2(d.getDate()) + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    const p = {};
+    new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+      .formatToParts(new Date()).forEach((x) => { p[x.type] = x.value; });
+    return p.year + '/' + p.month + '/' + p.day + ' ' + p.hour + ':' + p.minute;
   };
   const normTime = (s) => {
     const m = (s || '').match(/(\d{4})\/(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})/);
@@ -905,6 +912,9 @@
   if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating, loadConstDb, resolveChart, fixPlayKeys };
 
   // ---------- 历史走势 ----------
+  // 最近一次读到的历史（任何功能运行后都会更新）。从菜单再进「历史走势」时直接用它，不用重新读取
+  let histView = null;
+
   async function runHistory() {
     const { player, best, news, db } = await readB50();
     if (aborted) return;
@@ -913,35 +923,43 @@
     showHistoryPanel(hist, player, db);
   }
 
+  // 历史走势页（同 ongeki-score-export）：概况 + 走势图 + 单曲分数曲线。图都画在页面里，点曲目不用离开这个页面
   function showHistoryPanel(hist, player, db) {
+    histView = { hist, player, db };
     const { pb, updates } = derive(hist);
     box.innerHTML = '';
     const p = document.createElement('div');
-    p.style.cssText = 'margin:4vh auto 0;max-width:520px;text-align:left;';
+    p.style.cssText = 'margin:2vh auto 0;max-width:960px;text-align:left;';
+    box.appendChild(p);
+    const card = (css) => {
+      const d = document.createElement('div');
+      d.style.cssText = 'background:#1b2140;border:1px solid #fff2;border-radius:14px;padding:14px;margin-bottom:12px;' + (css || '');
+      p.appendChild(d);
+      return d;
+    };
     const first = hist.snaps[0];
     const last = hist.snaps[hist.snaps.length - 1];
-    p.innerHTML =
+    const info = card();
+    info.innerHTML =
       '<div style="font-size:20px;font-weight:bold;margin-bottom:6px;">历史走势</div>' +
       '<div style="font-size:14px;color:#ffffffcc;">' + esc(syncNote) + '</div>' +
-      '<div style="font-size:14px;color:#ffffffcc;margin:6px 0 12px;">' +
+      '<div style="font-size:14px;color:#ffffffcc;margin:6px 0 8px;">' +
       (hist.since ? '从 ' + esc(hist.since) + ' 开始记录　·　' : '') +
       hist.snaps.length + ' 个 Rating 快照　·　' +
       hist.obs.filter((o) => o.src === 'p').length + ' 条游玩记录　·　' + updates.length + ' 次推分' +
       (last ? '<br>当前 Rating ' + last.r.toFixed(2) + (first && first !== last ? '（' + signed(last.r - first.r) + '）' : '') : '') + '</div>';
-    box.appendChild(p);
-
     const mk = (label, css, fn) => {
       const b = document.createElement('button');
       b.textContent = label;
       b.style.cssText = btnCss + css;
       b.onclick = fn;
-      p.appendChild(b);
+      info.appendChild(b);
       return b;
     };
-    mk('生成走势图', 'background:#c9a2ff;color:#222;margin:4px 8px 8px 0;', () => run(() => showResult([() => drawTrend(hist, player, db)], 'chunithm-history')));
-    mk('返回菜单', 'background:#ffffff22;color:#fff;margin:4px 0 8px;padding:12px 20px;', showMenu);
-    p.appendChild(document.createElement('br'));
-    const small = 'background:#ffffff22;color:#fff;margin:0 8px 12px 0;padding:8px 16px;font-size:14px;';
+    const small = 'background:#ffffff22;color:#fff;margin:4px 8px 4px 0;padding:8px 16px;font-size:14px;';
+    mk('返回菜单', small, showMenu);
+    // 重新读取 CHUNITHM-NET 的数据（离开页面再回来时用的是上次读到的）
+    mk('重新读取', small, () => run(runHistory));
     if (SYNC_URL) {
       mk('更改同步名字', small, () => run(async () => {
         const h = await recordAndSync(lastRun, { forceAsk: true });
@@ -959,7 +977,7 @@
     });
     // 调试信息：プレイ履歴第一条的原始 HTML 等。复制后发给开发者
     mk('调试信息', small, async () => {
-      const info = JSON.stringify({
+      const text = JSON.stringify({
         ua: navigator.userAgent,
         scanned: lastRun && lastRun.all ? lastRun.all.length : null,
         scanPages: lastRun && lastRun.all ? lastRun.all.pages || null : null,
@@ -971,18 +989,22 @@
         listSample,
         history: { since: hist.since, snaps: hist.snaps.length, obs: hist.obs.length, plays: hist.obs.filter((o) => o.src === 'p').length, updates: updates.length, syncNote },
       }, null, 1);
-      let ta = p.querySelector('textarea');
+      let ta = info.querySelector('textarea');
       if (!ta) {
         ta = document.createElement('textarea');
         ta.readOnly = true;
-        ta.style.cssText = 'display:block;width:100%;height:180px;box-sizing:border-box;margin:0 0 12px;font:11px monospace;background:#0d1020;color:#ddd;border:1px solid #fff3;border-radius:8px;';
-        sec.before(ta);
+        ta.style.cssText = 'display:block;width:100%;height:180px;box-sizing:border-box;margin:8px 0 0;font:11px monospace;background:#0d1020;color:#ddd;border:1px solid #fff3;border-radius:8px;';
+        info.appendChild(ta);
       }
-      ta.value = info;
-      try { await navigator.clipboard.writeText(info); alert('调试信息已复制，粘贴发给开发者即可。'); } catch (e) { ta.focus(); ta.select(); }
+      ta.value = text;
+      try { await navigator.clipboard.writeText(text); alert('调试信息已复制，粘贴发给开发者即可。'); } catch (e) { ta.focus(); ta.select(); }
     });
 
-    // 单曲曲线：只列出プレイ履歴里出现过、或有推分记录的谱面
+    // 走势图：直接画在页面里
+    const trendBox = card('padding:10px;text-align:center;color:#ffffffaa;');
+    trendBox.textContent = '正在生成走势图…';
+
+    // 单曲分数曲线：只列出プレイ履歴里出现过、或有推分记录的谱面；点一首，曲线画在列表下面
     const pushed = new Set(updates.map((u) => u.k));
     const songs = new Map();
     hist.obs.forEach((o) => {
@@ -992,14 +1014,14 @@
       if (o.t > e.last) e.last = o.t;
       songs.set(o.k, e);
     });
-    const sec = document.createElement('div');
-    sec.style.cssText = 'background:#1b2140;border:1px solid #fff2;border-radius:14px;padding:14px;';
+    const sec = card();
     sec.innerHTML = '<div style="font-weight:bold;margin-bottom:6px;">单曲分数曲线</div>' +
       '<input id="b50-q" placeholder="输入曲名搜索" autocomplete="off" style="width:100%;box-sizing:border-box;padding:8px 10px;' +
       'border-radius:8px;border:1px solid #fff4;background:#0d1020;color:#fff;font:16px ' + FONT + ';">' +
       '<div id="b50-songs" style="margin-top:8px;"></div>';
-    p.appendChild(sec);
+    const curveBox = card('display:none;padding:10px;text-align:center;color:#ffffffaa;');
     const listEl = sec.querySelector('#b50-songs');
+    let curveSeq = 0;
     const render = () => {
       const q = normTitle(sec.querySelector('#b50-q').value).toLowerCase();
       const items = [...songs.values()]
@@ -1018,17 +1040,33 @@
         row.innerHTML = '<span style="background:' + DIFFS[e.d].color + ';border-radius:4px;padding:0 6px;font-weight:bold;font-size:12px;">' +
           DIFFS[e.d].short + '</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(e.n) +
           '</span><span style="color:#ffffff99;font-size:12px;">' + (pb[e.k] || 0).toLocaleString('en-US') + '　' + e.plays + ' 次</span>';
-        row.onclick = () => run(async () => {
-          const idx = e.k.startsWith('n:') ? 'n' : e.k.split(':')[0];
-          const s = enrich({ idx, diff: e.d, title: e.n, score: pb[e.k] || 0 }, db);
-          if (s.jacket) await loadJackets([s]);
-          await showResult([() => drawSongCurve(hist, e, s, player, db)], 'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40));
-        });
+        row.onclick = async () => {
+          const seq = ++curveSeq; // 连续点了几首时，只显示最后点的那首
+          curveBox.style.display = '';
+          curveBox.textContent = '正在生成 ' + e.n + ' 的走势图…';
+          curveBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          try {
+            const idx = e.k.startsWith('n:') ? 'n' : e.k.split(':')[0];
+            const s = enrich({ idx, diff: e.d, title: e.n, score: pb[e.k] || 0 }, db);
+            if (s.jacket) await loadJackets([s], (t) => { if (seq === curveSeq) curveBox.textContent = t; });
+            if (seq !== curveSeq) return;
+            await renderImages(curveBox, [() => drawSongCurve(hist, e, s, player, db)],
+              'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40), {
+                inline: true,
+                back: { label: '收起', fn: () => { curveBox.style.display = 'none'; sec.scrollIntoView({ block: 'start' }); } },
+              });
+          } catch (err) {
+            if (seq === curveSeq) curveBox.textContent = '生成失败：' + (err.message || err);
+          }
+        };
         listEl.appendChild(row);
       });
     };
     sec.querySelector('#b50-q').oninput = render;
     render();
+
+    renderImages(trendBox, [() => drawTrend(hist, player, db)], 'chunithm-history', { inline: true })
+      .catch((err) => { trendBox.textContent = '走势图生成失败：' + (err.message || err); });
   }
 
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1269,10 +1307,13 @@
       : c.from === null ? c.to : (c.from || 'CLEAR') + '→' + c.to)).join(' · ');
   }
 
-  // 推算每次推分对账号 Rating 的影响（与 ongeki-score-export / maimai-dx-score 相同的做法）。
-  // 以推分之前最近的快照（当时完整的 BEST 30 / NEW 20）为起点，按时间顺序依次放入每次推分后的单曲 Rating，
-  // 超出枠的数量时挤掉最低的一首；账号 Rating = 50 首单曲 Rating 之和 ÷ 50 截断到 0.01。经过新的快照时以快照为准重新开始。
-  // CHUNITHM 的 Rating 和 FC/AJ 无关：只有标记提升的推分，单曲和账号 Rating 都不变
+  // 每次推分对账号 Rating 的影响。
+  // 两个快照之间的推分按时间顺序放进 B50：以前一个快照（当时完整的 BEST 30 / NEW 20）为起点，
+  // 放入推分后的单曲 Rating，超出枠的数量时挤掉最低的一首。账号 Rating = 50 首单曲 Rating 之和 ÷ 50 截断到 0.01。
+  // 首尾都对齐游戏里显示的真实 Rating：游戏只显示到 0.01，后面的余数不知道，取一个让「开始 = 前一个快照的 Rating、
+  // 结束 = 后一个快照的 Rating」同时成立的余数，再逐条计算，所以同一段里各条推分的变化加起来正好等于两个快照的差。
+  // 怎么取都对不上时（两次运行之间有没记录到的游玩等），差额写在这一段最后一条推分上，不硬凑。
+  // 新曲 / 旧曲看后一个快照里这首歌在哪个框；不在 B50 里的才按版本判断。CHUNITHM 的 Rating 和 FC/AJ 无关
   function accountImpact(hist, updates, db) {
     const snaps = hist.snaps;
     const cache = new Map();
@@ -1281,61 +1322,109 @@
       if (!cache.has(id)) cache.set(id, centsOf(s, constOf(k, n, diffOfKey(k), db).c));
       return cache.get(id);
     };
-    // 属于 NEW 还是 BEST：先看出现在哪个框的快照里，都没出现过就看版本是否和 NEW 20 的主流版本相同
-    const inNew = new Set(), inBest = new Set();
-    snaps.forEach((s) => { s.news.forEach((e) => inNew.add(e[0])); s.best.forEach((e) => inBest.add(e[0])); });
     const verCount = {};
     const latest = snaps[snaps.length - 1];
     if (latest) latest.news.forEach((e) => { const m = db.byId.get(e[0].split(':')[0]); if (m && m.version) verCount[m.version] = (verCount[m.version] || 0) + 1; });
     const newVer = Object.keys(verCount).sort((a, b) => verCount[b] - verCount[a])[0];
-    const isNew = (k) => (inNew.has(k) ? true : inBest.has(k) ? false : !!(newVer && (db.byId.get(k.split(':')[0]) || {}).version === newVer));
+    const inNew = new Set(), inBest = new Set();
+    snaps.forEach((s) => { s.news.forEach((e) => inNew.add(e[0])); s.best.forEach((e) => inBest.add(e[0])); });
+    const isNewGuess = (k) => (inNew.has(k) ? true : inBest.has(k) ? false : !!(newVer && (db.byId.get(k.split(':')[0]) || {}).version === newVer));
     // 快照里存了单曲 Rating（e[3]）就直接用，旧版本的快照按分数和现在的定数计算
     const fromSnap = (s) => ({
       best: new Map(s.best.map((e) => [e[0], e[3] != null ? e[3] : cents(e[0], e[1], e[2])])),
       news: new Map(s.news.map((e) => [e[0], e[3] != null ? e[3] : cents(e[0], e[1], e[2])])),
     });
     const sum = (st) => [...st.best.values(), ...st.news.values()].reduce((a, v) => a + v, 0);
-    // 放入一个值；超出 cap 时挤掉最低的一首（可能就是它自己）
-    const put = (m, k, v, cap) => {
+    // 放入一个值；超出 cap 时挤掉最低的一首（可能就是它自己）。
+    // keep = 后一个快照里这首歌确实在这个框里：一定留下，挤掉的是除它以外最低的一首
+    const put = (m, k, v, cap, keep) => {
       const was = m.has(k);
       if (!was || v > m.get(k)) m.set(k, v);
       if (m.size > cap) {
         let low = null, lowV = Infinity;
-        m.forEach((x, kk) => { if (x < lowV || (x === lowV && kk === k)) { low = kk; lowV = x; } });
+        m.forEach((x, kk) => { if (keep && kk === k) return; if (x < lowV || (x === lowV && kk === k)) { low = kk; lowV = x; } });
         m.delete(low);
       }
       return { entered: !was && m.has(k), inFrame: m.has(k) };
     };
+
+    // 按「在哪两个快照之间」分组
     const out = new Map();
-    let si = -1, st = null;
+    const groups = new Map();
     updates.slice().sort(byTime).forEach((u) => {
-      // 没有曲目列表的快照（数据不全）不能当起点
-      while (si + 1 < snaps.length && snaps[si + 1].t < u.t) { si++; st = snaps[si].best.length || snaps[si].news.length ? fromSnap(snaps[si]) : null; }
-      if (!st) { out.set(u, { noSnap: true }); return; }
-      if (!constOf(u.k, u.n, u.d, db).c) { out.set(u, { noConst: true }); return; }
-      if (!u.changes.some((c) => c.type === 'score')) { out.set(u, { lampOnly: true }); return; }
-      const before = sum(st);
-      const frame = st.best.has(u.k) ? 'best' : st.news.has(u.k) ? 'news' : (isNew(u.k) ? 'news' : 'best');
-      const res = { frame: frame === 'best' ? 'BEST 30' : 'NEW 20' };
-      Object.assign(res, put(st[frame], u.k, cents(u.k, u.n, u.after.s), frame === 'best' ? 30 : 20));
-      const after = sum(st);
-      res.delta = Math.floor(after / 50) - Math.floor(before / 50); // 账号 Rating 显示值的变化（0.01 单位）
-      res.exact = (after - before) / 50 / 100;
-      out.set(u, res);
+      let i = -1;
+      while (i + 1 < snaps.length && snaps[i + 1].t < u.t) i++;
+      if (i < 0 || !(snaps[i].best.length || snaps[i].news.length)) { out.set(u, { noSnap: true }); return; }
+      if (!groups.has(i)) groups.set(i, []);
+      groups.get(i).push(u);
+    });
+
+    groups.forEach((list, i) => {
+      const prev = snaps[i], next = snaps[i + 1] || null;
+      const nextBest = next ? new Set(next.best.map((e) => e[0])) : null;
+      const nextNew = next ? new Set(next.news.map((e) => e[0])) : null;
+      const nextRow = next ? new Map([...next.best, ...next.news].map((e) => [e[0], e])) : new Map();
+      const st = fromSnap(prev);
+      const s0 = sum(st);
+      const steps = []; // [{u, res, d}]  d = 50 首合计的变化（0.01 单位）
+      list.forEach((u) => {
+        if (!constOf(u.k, u.n, u.d, db).c) { steps.push({ u, res: { noConst: true }, d: 0 }); return; }
+        if (!u.changes.some((c) => c.type === 'score')) { steps.push({ u, res: { lampOnly: true }, d: 0 }); return; }
+        const frame = nextBest && nextBest.has(u.k) ? 'best' : nextNew && nextNew.has(u.k) ? 'news'
+          : st.best.has(u.k) ? 'best' : st.news.has(u.k) ? 'news' : (isNewGuess(u.k) ? 'news' : 'best');
+        const before = sum(st);
+        const res = { frame: frame === 'best' ? 'BEST 30' : 'NEW 20' };
+        // 后一个快照里有真实的 B50：在里面 → 一定算进去；不在里面（也不在原来的 B50 里）→ 没进，账号 Rating 不变
+        const inNext = next ? (nextBest.has(u.k) || nextNew.has(u.k)) : null;
+        if (inNext === false && !st[frame].has(u.k)) Object.assign(res, { entered: false, inFrame: false });
+        else {
+          // 推分后的分数和后一个快照里的一样时，用快照里记下的单曲 Rating（和 B50 页面一致）
+          const nr = nextRow.get(u.k);
+          const v = nr && nr[2] === u.after.s && nr[3] != null ? nr[3] : cents(u.k, u.n, u.after.s);
+          Object.assign(res, put(st[frame], u.k, v, frame === 'best' ? 30 : 20, inNext === true));
+        }
+        steps.push({ u, res, d: sum(st) - before });
+      });
+      // 余数：开始的合计 T0 要满足 floor(T0/50) = 前一个快照的 Rating；有后一个快照时，floor((T0 + 合计变化)/50) = 后一个快照的 Rating
+      const total = steps.reduce((a, x) => a + x.d, 0);
+      const r0 = Math.round((prev.r || 0) * 100);
+      let t0;
+      let gap = 0;
+      if (!r0) t0 = s0; // 快照里没有游戏的 Rating：只能用计算值
+      else {
+        const base = r0 * 50, frac = ((s0 % 50) + 50) % 50;
+        let lo = base, hi = base + 49;
+        if (next && next.r) {
+          const r1 = Math.round(next.r * 100);
+          lo = Math.max(lo, r1 * 50 - total);
+          hi = Math.min(hi, r1 * 50 + 49 - total);
+          if (lo > hi) { lo = hi = base + frac; gap = r1 - Math.floor((base + frac + total) / 50); }
+        }
+        t0 = Math.min(hi, Math.max(lo, base + frac));
+      }
+      let cur = t0;
+      steps.forEach((x, k) => {
+        const delta = Math.floor((cur + x.d) / 50) - Math.floor(cur / 50);
+        cur += x.d;
+        if (x.res.frame) { x.res.delta = delta; x.res.exact = x.d / 50 / 100; }
+        if (gap && k === steps.length - 1) x.res.gap = gap;
+        out.set(x.u, x.res);
+      });
     });
     return out;
   }
 
-  // 「进入 BEST 30 · 账号 Rating +0.02（推算）」之类的说明文字和颜色
+  // 「进入 BEST 30 · 账号 Rating +0.02」之类的说明文字和颜色
   const GOOD = '#7ee0a0';
   const impactText = (im) => {
-    if (!im || im.noSnap) return ['之前没有快照，无法推算账号 Rating', '#ffffff55'];
-    if (im.noConst) return ['定数未知，无法推算账号 Rating', '#ffffff66'];
-    if (im.lampOnly) return ['只有标记提升 · 单曲 Rating 和账号 Rating 不变', '#ffffff66'];
+    if (!im || im.noSnap) return ['之前没有快照，算不出账号 Rating 的变化', '#ffffff55'];
+    const gap = im.gap ? (im.gap > 0 ? ' · 另有 +' : ' · 另有 −') + (Math.abs(im.gap) / 100).toFixed(2) + ' 来自没记录到的变化' : '';
+    if (im.noConst) return ['定数未知，算不出账号 Rating 的变化' + gap, '#ffffff66'];
+    if (im.lampOnly) return ['只有标记提升 · 单曲 Rating 和账号 Rating 不变' + gap, '#ffffff66'];
     const head = im.entered ? '进入 ' + im.frame : im.inFrame ? im.frame + ' 内提升' : '未进入 ' + im.frame;
-    if (im.delta > 0) return [head + ' · 账号 Rating +' + (im.delta / 100).toFixed(2) + '（推算）', GOOD];
-    if (im.exact > 0) return [head + ' · 账号 Rating 不变（+' + im.exact.toFixed(4) + '，未进位，推算）', '#ffffff99'];
-    return [head + ' · 账号 Rating 不变（推算）', '#ffffff66'];
+    if (im.delta > 0) return [head + ' · 账号 Rating +' + (im.delta / 100).toFixed(2) + gap, GOOD];
+    if (im.exact > 0) return [head + ' · 账号 Rating 不变（+' + im.exact.toFixed(4) + '，未进位）' + gap, '#ffffff99'];
+    return [head + ' · 账号 Rating 不变' + gap, '#ffffff66'];
   };
 
   const LAMP_COLOR = { FC: '#7ee0ff', AJ: '#ffb86b', AJC: '#ffd65a' };
@@ -1690,15 +1779,21 @@
     return t + '…';
   }
 
-  // 逐张绘制 → 导出为 PNG Blob → 立即释放 canvas，避免 iOS 的 canvas 总内存上限
-  async function showResult(drawers, name) {
+  // 逐张绘制 → 导出为 PNG Blob → 立即释放 canvas，避免 iOS 的 canvas 总内存上限。
+  // 画到 target 里（整页时 target = box；历史走势页里是页面中的一块区域）。
+  //   opts.progress(text)：进度提示；opts.back：{label, fn} 左下的返回按钮；opts.inline：显示在页面里（提示文字简短，不显示同步状态）
+  async function renderImages(target, drawers, name, opts) {
+    opts = opts || {};
+    const progress = opts.progress || ((t) => { target.textContent = t; });
     const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
       (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    (target._urls || []).forEach((u) => URL.revokeObjectURL(u)); // 同一块区域重新生成时，释放上一次的图片
+    target._urls = [];
     const results = [];
     let tainted = false;
     for (let i = 0; i < drawers.length; i++) {
       if (aborted) return;
-      say('正在绘制图片…' + (drawers.length > 1 ? ' ' + (i + 1) + '/' + drawers.length : ''));
+      progress('正在绘制图片…' + (drawers.length > 1 ? ' ' + (i + 1) + '/' + drawers.length : ''));
       await new Promise((r) => setTimeout(r, 30));
       const cv = drawers[i]();
       let blob = null;
@@ -1708,18 +1803,22 @@
       if (blob) {
         cv.width = cv.height = 0;
         const fname = name + (drawers.length > 1 ? '-' + (i + 1) : '') + '.png';
-        results.push({ blob, url: URL.createObjectURL(blob), file: new File([blob], fname, { type: 'image/png' }), fname });
+        const url = URL.createObjectURL(blob);
+        target._urls.push(url);
+        results.push({ blob, url, file: new File([blob], fname, { type: 'image/png' }), fname });
       } else {
         results.push({ canvas: cv });
       }
     }
 
-    box.innerHTML = '';
+    target.innerHTML = '';
     const tip = document.createElement('div');
-    tip.style.cssText = 'margin:8px 0 4px;padding:0 44px;font-size:14px;color:#ffffffcc;';
+    tip.style.cssText = opts.inline ? 'margin:0 0 4px;font-size:13px;color:#ffffffaa;text-align:center;'
+      : 'margin:8px 0 4px;padding:0 44px;font-size:14px;color:#ffffffcc;';
     const top = document.createElement('div');
-    top.style.cssText = 'margin:0 0 12px;';
-    box.append(tip, top);
+    top.style.cssText = opts.inline ? 'margin:0 0 8px;text-align:center;' : 'margin:0 0 12px;';
+    target.append(tip, top);
+    const small = opts.inline ? 'padding:6px 16px;font-size:14px;margin:4px;' : 'padding:8px 20px;';
 
     const files = results.filter((r) => r.file).map((r) => r.file);
     let canShare = false;
@@ -1728,7 +1827,7 @@
       // iOS：分享面板里选「存储图像」即可直接存进相册
       const sb = document.createElement('button');
       sb.textContent = isIOS ? '保存到相册 / 分享' : '分享';
-      sb.style.cssText = btnCss + 'background:#7ee0ff;color:#222;padding:8px 20px;';
+      sb.style.cssText = btnCss + 'background:#7ee0ff;color:#222;' + small;
       sb.onclick = () => {
         navigator.share({ files }).catch((e) => { if (e && e.name !== 'AbortError') alert('分享失败：' + e.message); });
       };
@@ -1739,14 +1838,16 @@
       const a = document.createElement('a');
       a.href = r.url; a.download = r.fname;
       a.textContent = '下载 PNG' + (results.length > 1 ? ' ' + (i + 1) : '');
-      a.style.cssText = btnCss + 'background:#ffd65a;color:#222;padding:8px 20px;text-decoration:none;';
+      a.style.cssText = btnCss + 'background:#ffd65a;color:#222;text-decoration:none;' + small;
       top.appendChild(a);
     });
-    const back = document.createElement('button');
-    back.textContent = '返回菜单';
-    back.style.cssText = btnCss + 'background:#ffffff22;color:#fff;padding:8px 20px;';
-    back.onclick = () => { results.forEach((r) => r.url && URL.revokeObjectURL(r.url)); showMenu(); };
-    top.appendChild(back);
+    if (opts.back) {
+      const back = document.createElement('button');
+      back.textContent = opts.back.label;
+      back.style.cssText = btnCss + 'background:#ffffff22;color:#fff;' + small;
+      back.onclick = opts.back.fn;
+      top.appendChild(back);
+    }
 
     results.forEach((r) => {
       if (r.url) {
@@ -1756,25 +1857,31 @@
         // 允许 iOS 长按弹出「存储到照片」
         img.style.cssText = 'display:block;width:100%;height:auto;border-radius:8px;margin-bottom:16px;' +
           '-webkit-touch-callout:default;-webkit-user-select:auto;user-select:auto;';
-        box.appendChild(img);
+        target.appendChild(img);
       } else {
         r.canvas.style.cssText = 'display:block;width:100%;height:auto;margin-bottom:16px;';
-        box.appendChild(r.canvas);
+        target.appendChild(r.canvas);
       }
     });
 
     const many = results.length > 1 ? '（共 ' + results.length + ' 张）' : '';
     if (tainted) tip.textContent = '图片已生成，但浏览器不允许导出（曲绘跨域），请截图保存。';
+    else if (opts.inline) tip.textContent = isIOS ? '长按图片 →「存储到照片」' : '可以下载，手机也可以长按图片保存';
     else if (isIOS) {
       tip.textContent = '生成完成' + many + '！' + (canShare ? '点「保存到相册」后选「存储图像」，或' : '') +
         '长按图片 →「存储到照片」。「下载 PNG」会存到「文件」App。';
     }
     else tip.textContent = '生成完成' + many + '！点「下载 PNG」，手机也可以长按图片保存。';
-    if (syncNote) {
+    if (syncNote && !opts.inline) {
       const sn = document.createElement('div');
       sn.style.cssText = 'margin-top:4px;font-size:13px;color:' + (/失败|不足/.test(syncNote) ? '#ff8a8a' : '#ffffff88') + ';';
       sn.textContent = syncNote;
       tip.appendChild(sn);
     }
+  }
+
+  // 整页显示（B50、定数筛选）
+  function showResult(drawers, name, back) {
+    return renderImages(box, drawers, name, { progress: say, back: back || { label: '返回菜单', fn: showMenu } });
   }
 })();
