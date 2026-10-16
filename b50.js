@@ -314,7 +314,11 @@
   };
 
   // ---------- 计算 ----------
-  // 単曲レート（VERSE 以降の計算式）
+  // 単曲レート（VERSE 以降の計算式。攻略 Wiki「レーティング・OVER POWER」の表）
+  //   SSS+ 1,009,000 定数+2.15（上限）/ SSS 1,007,500 +2.00（100 点毎 +0.01）/ SS+ 1,005,000 +1.50（50 点毎）
+  //   SS 1,000,000 +1.00（100 点毎）/ S+ 990,000 +0.60・S 975,000 ±0（250 点毎）
+  //   A〜AAA：A 900,000 の −5.00 から「(900,000 を超えた分 / 75,000) × 5.00」（150 点毎 +0.01。AAA −1.67、AA −3.34）
+  //   旧バージョンの「925,000〜975,000 で −3.00〜±0」とは違う。プレイヤーの実際の Rating（3 回分）で確認済み
   const songRating = (s, c) => {
     if (!c) return 0;
     let r;
@@ -323,8 +327,7 @@
     else if (s >= 1005000) r = c + 1.5 + (s - 1005000) / 50 * 0.01;
     else if (s >= 1000000) r = c + 1.0 + (s - 1000000) / 100 * 0.01;
     else if (s >= 975000) r = c + (s - 975000) / 250 * 0.01;
-    else if (s >= 925000) r = c - 3 + (s - 925000) * 3 / 50000;
-    else if (s >= 900000) r = c - 5 + (s - 900000) * 2 / 25000;
+    else if (s >= 900000) r = c - 5 + (s - 900000) / 15000;
     else if (s >= 800000) r = (c - 5) / 2 + (s - 800000) * ((c - 5) / 2) / 100000;
     else if (s >= 500000) r = ((c - 5) / 2) * (s - 500000) / 300000;
     else r = 0;
@@ -1363,8 +1366,9 @@
     const isNewGuess = (k) => (inNew.has(k) ? true : inBest.has(k) ? false : !!(newVer && (db.byId.get(k.split(':')[0]) || {}).version === newVer));
     // 快照里存了单曲 Rating（e[3]）就直接用，旧版本的快照按分数和现在的定数计算
     const fromSnap = (s) => ({
-      best: new Map(s.best.map((e) => [e[0], e[3] != null ? e[3] : cents(e[0], e[1], e[2])])),
-      news: new Map(s.news.map((e) => [e[0], e[3] != null ? e[3] : cents(e[0], e[1], e[2])])),
+      // 快照里存的单曲 Rating（e[3]）是当时按本工具的公式算的（旧版本用过有误的公式），一律按分数用现在的公式重算
+      best: new Map(s.best.map((e) => [e[0], cents(e[0], e[1], e[2])])),
+      news: new Map(s.news.map((e) => [e[0], cents(e[0], e[1], e[2])])),
     });
     const sum = (st) => [...st.best.values(), ...st.news.values()].reduce((a, v) => a + v, 0);
     // 放入一个值；超出 cap 时挤掉最低的一首（可能就是它自己）。
@@ -1379,6 +1383,27 @@
       }
       return { entered: !was && m.has(k), inFrame: m.has(k) };
     };
+
+    // 定数表和游戏的偏差：按定数表算的 50 首合计 − 游戏里的真实合计（0.01 单位）。
+    // 每个快照只知道游戏 Rating（截断到 0.01），所以偏差在一个范围里：[合计 − (r×50+49), 合计 − r×50]。
+    // 连续的快照能取到同一个偏差就合在一起（约束越多越准）；对不上了（定数表更新、B50 换了一批歌等）就从那里重新开始。
+    // 在范围里取最接近 0 的值：定数表尽量当作是对的，只修正必须修正的部分
+    const runOf = [], runRange = [];
+    snaps.forEach((s, idx) => {
+      const r = Math.round((s.r || 0) * 100);
+      const rng = r && (s.best.length || s.news.length) ? (() => { const T = sum(fromSnap(s)); return [T - (r * 50 + 49), T - r * 50]; })() : null;
+      const run = runRange.length - 1;
+      const cur = run >= 0 ? runRange[run] : null;
+      if (!rng) { runOf[idx] = Math.max(run, 0); if (run < 0) runRange.push([-Infinity, Infinity]); return; }
+      if (cur && Math.max(cur[0], rng[0]) <= Math.min(cur[1], rng[1])) {
+        runRange[run] = [Math.max(cur[0], rng[0]), Math.min(cur[1], rng[1])];
+        runOf[idx] = run;
+      } else {
+        runRange.push(rng);
+        runOf[idx] = runRange.length - 1;
+      }
+    });
+    const offsetOf = (idx) => { const [lo, hi] = runRange[runOf[idx]]; return Math.min(hi, Math.max(lo, 0)); };
 
     // 按「在哪两个快照之间」分组
     const out = new Map();
@@ -1395,7 +1420,6 @@
       const prev = snaps[i], next = snaps[i + 1] || null;
       const nextBest = next ? new Set(next.best.map((e) => e[0])) : null;
       const nextNew = next ? new Set(next.news.map((e) => e[0])) : null;
-      const nextRow = next ? new Map([...next.best, ...next.news].map((e) => [e[0], e])) : new Map();
       const st = fromSnap(prev);
       const s0 = sum(st);
       const steps = []; // [{u, res, d}]  d = 50 首合计的变化（0.01 单位）
@@ -1409,32 +1433,14 @@
         // 后一个快照里有真实的 B50：在里面 → 一定算进去；不在里面（也不在原来的 B50 里）→ 没进，账号 Rating 不变
         const inNext = next ? (nextBest.has(u.k) || nextNew.has(u.k)) : null;
         if (inNext === false && !st[frame].has(u.k)) Object.assign(res, { entered: false, inFrame: false });
-        else {
-          // 推分后的分数和后一个快照里的一样时，用快照里记下的单曲 Rating（和 B50 页面一致）
-          const nr = nextRow.get(u.k);
-          const v = nr && nr[2] === u.after.s && nr[3] != null ? nr[3] : cents(u.k, u.n, u.after.s);
-          Object.assign(res, put(st[frame], u.k, v, frame === 'best' ? 30 : 20, inNext === true));
-        }
+        else Object.assign(res, put(st[frame], u.k, cents(u.k, u.n, u.after.s), frame === 'best' ? 30 : 20, inNext === true));
         steps.push({ u, res, d: sum(st) - before });
       });
-      // 余数：开始的合计 T0 要满足 floor(T0/50) = 前一个快照的 Rating；有后一个快照时，floor((T0 + 合计变化)/50) = 后一个快照的 Rating
+      // 起点：按定数表算的合计减去偏差（见上面 offsetOf），保证 floor(起点/50) = 前一个快照的游戏 Rating。
+      // 结束时和后一个快照的游戏 Rating 还差多少（没记录到的游玩、定数表在这段时间里变了等），写在最后一条推分上
       const total = steps.reduce((a, x) => a + x.d, 0);
-      const r0 = Math.round((prev.r || 0) * 100);
-      let t0;
-      let gap = 0;
-      if (!r0) t0 = s0; // 快照里没有游戏的 Rating：只能用计算值
-      else {
-        const base = r0 * 50, frac = ((s0 % 50) + 50) % 50;
-        let lo = base, hi = base + 49;
-        if (next && next.r) {
-          const r1 = Math.round(next.r * 100);
-          lo = Math.max(lo, r1 * 50 - total);
-          hi = Math.min(hi, r1 * 50 + 49 - total);
-          if (lo > hi) { lo = hi = base + frac; gap = r1 - Math.floor((base + frac + total) / 50); }
-        }
-        // 计算出的余数不在可行范围里时取范围的中间（贴着边界会让进位系统性地偏早或偏晚）
-        t0 = base + frac >= lo && base + frac <= hi ? base + frac : Math.floor((lo + hi) / 2);
-      }
+      const t0 = prev.r ? s0 - offsetOf(i) : s0;
+      const gap = next && next.r && prev.r ? Math.round(next.r * 100) - Math.floor((t0 + total) / 50) : 0;
       let cur = t0;
       steps.forEach((x, k) => {
         const delta = Math.floor((cur + x.d) / 50) - Math.floor(cur / 50);
@@ -1476,7 +1482,8 @@
     const impact = accountImpact(hist, updates, db);
     const snaps = hist.snaps;
     const last = snaps[snaps.length - 1], prev = snaps[snaps.length - 2];
-    const rowCents = (e) => (e[3] != null ? e[3] : centsOf(e[2], constOf(e[0], e[1], diffOfKey(e[0]), db).c));
+    // 快照里存的单曲 Rating 可能是旧公式算的，按分数用现在的公式重算
+    const rowCents = (e) => centsOf(e[2], constOf(e[0], e[1], diffOfKey(e[0]), db).c);
 
     // 和上一次快照相比：B50 的进出与提升（分数、标记都算）
     const rows = []; // {side:'L'|'R', e, color, right, sub}
