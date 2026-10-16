@@ -406,7 +406,9 @@
   const HIST_V = 3;
   // scans：每次完整全曲扫描的时间和覆盖的难度，'YYYY/MM/DD HH:MM|2,3,4'。
   //   起点之后才第一次出现的谱面，如果之前已经有覆盖这个难度的完整扫描（那时还没打过），就是新打的，算推分（首次）
-  const emptyHist = () => ({ v: HIST_V, game: 'chunithm', name: '', since: '', obs: [], snaps: [], scans: [] });
+  // resetAt：「从现在重新开始记录」的时间。只有这个标记会让合并时丢掉更早的记录；
+  //   新设备、清过浏览器数据等「本机没有记录」的情况不会写这个标记，合并时起点取较早的，数据只增不减
+  const emptyHist = () => ({ v: HIST_V, game: 'chunithm', name: '', since: '', resetAt: '', obs: [], snaps: [], scans: [] });
   function migrateHist(h) {
     if (!h || !h.obs) return emptyHist();
     if (h.v === HIST_V) return h;
@@ -512,8 +514,11 @@
   const mergeHist = (a, b) => {
     const out = emptyHist();
     out.name = b.name || a.name;
-    // 起点取较晚的（在某台设备上「从现在重新开始记录」后，别的设备上起点之前的记录也一起丢掉）
-    out.since = [a.since || '', b.since || ''].sort().pop();
+    // 起点取较早的：一边是新设备（本机没有记录，起点 = 这次）时，另一边更早的历史要全部保留。
+    // 只有「从现在重新开始记录」（resetAt）才丢掉它之前的记录，在任何一台设备上点过都对所有设备生效
+    out.resetAt = [a.resetAt || '', b.resetAt || ''].sort().pop();
+    out.since = [a.since, b.since].filter(Boolean).sort()[0] || '';
+    if (out.resetAt > out.since) out.since = out.resetAt;
     const seen = new Set();
     [...a.obs, ...b.obs].forEach((o) => { const id = obsId(o); if (!seen.has(id)) { seen.add(id); out.obs.push(o); } });
     out.obs = out.obs.filter((o) => o.t >= out.since).sort(byTime);
@@ -652,7 +657,9 @@
     for (let attempt = 0; attempt < 3; attempt++) {
       const { data, sha } = await syncGet(acc);
       // 云端是旧版本（没有起点）的记录：先按起点转换再合并
-      const merged = data && data.obs ? mergeHist(migrateHist(data), local) : local;
+      // 云端有文件但不是历史记录的格式：不覆盖，报错（避免用本机数据把云端冲掉）
+      if (data && !data.obs) throw new Error('云端数据格式不对，没有改动云端');
+      const merged = data ? mergeHist(migrateHist(data), local) : local;
       if (data && JSON.stringify(data) === JSON.stringify(merged)) return merged;
       // 写入冲突（别的设备刚好也在写）时重新读取再合并
       if (await syncPut(acc, merged, sha)) return merged;
@@ -737,7 +744,44 @@
       if (/登录|维护/.test(e.message)) throw e;
       note += '（游玩记录读取失败）';
     }
-    const local = opts.reset ? emptyHist() : loadLocalHist(player.name);
+    // 「从现在重新开始记录」：清空本机记录并写下 resetAt 标记，同步时云端更早的记录也会丢掉
+    let local = loadLocalHist(player.name);
+    if (opts.reset) { local = emptyHist(); local.resetAt = nowStr(); }
+
+    // 开启了同步：先把云端的历史并入本机，再记录这次的数据。
+    // 这样新设备 / 清过浏览器数据时，第一次运行就能接上云端的历史，「上一次查询之后」的游玩也不会漏记
+    let acc = null, pending = [], syncErr = null;
+    const accounts = store.get('accounts', {});
+    if (SYNC_URL) {
+      acc = opts.forceAsk ? undefined : accounts[player.name];
+      try {
+        if (acc === undefined) {
+          await syncFetch('_ping'); // 先确认连得上，连不上就不询问（错误会显示在结果页 / 历史页）
+          acc = await askAccount(player);
+          // 选「暂不同步」也记下来，避免每次都问；可在「历史走势」里「更改同步名字」
+          accounts[player.name] = acc;
+          store.set('accounts', accounts);
+        }
+        if (acc) {
+          // 2026/10/15 版本保存的名字没有统一全角/半角：改用统一后的名字，并把旧写法文件里的记录合并过来
+          const legacy = [...new Set([acc, legacyAccount(player.name)])].filter((n) => n && n !== cleanAccount(n) && cleanAccount(n) === cleanAccount(acc));
+          if (acc !== cleanAccount(acc)) {
+            acc = cleanAccount(acc);
+            accounts[player.name] = acc;
+            store.set('accounts', accounts);
+          }
+          const migrated = store.get('migrated', []);
+          pending = legacy.filter((old) => !migrated.includes(old + '>' + acc));
+          say('正在读取云端历史…');
+          for (const name of [...pending, acc]) {
+            const { data } = await syncGet(name);
+            if (data && !data.obs) throw new Error('云端数据格式不对（' + name + '），没有改动云端');
+            if (data) local = mergeHist(migrateHist(data), local);
+          }
+        }
+      } catch (e) { syncErr = e; }
+    }
+
     // 只记「上一次查询之后」的游玩（第一次 = 起点，之前的游玩都不记）。
     // 上一次查询时间 = 历史里最后一个快照 / 成绩扫描的时间。和上次同一分钟的游玩按「时间 + 曲名 + 难度 + 分数」去重
     const lastQuery = [...local.snaps.map((x) => x.t), ...local.obs.filter((o) => o.src === 'b').map((o) => o.t)].sort().pop() || '';
@@ -746,34 +790,13 @@
     const savedLocal = saveLocalHist(player.name, hist);
     syncNote = (savedLocal ? '历史记录已保存在本机' : '本机存储空间不足，历史记录未保存') + note;
     if (!SYNC_URL) return hist;
-
-    const accounts = store.get('accounts', {});
-    let acc = opts.forceAsk ? undefined : accounts[player.name];
+    if (syncErr) { syncNote = '同步失败：' + syncErr.message + '。已保存在本机，下次运行会重试' + note; return hist; }
+    if (!acc) { syncNote += '（未开启云端同步）'; return hist; }
     try {
-      if (acc === undefined) {
-        await syncFetch('_ping'); // 先确认连得上，连不上就不询问（错误会显示在结果页 / 历史页）
-        acc = await askAccount(player);
-        // 选「暂不同步」也记下来，避免每次都问；可在「历史走势」里「更改同步名字」
-        accounts[player.name] = acc;
-        store.set('accounts', accounts);
-      }
-      if (!acc) { syncNote += '（未开启云端同步）'; return hist; }
-      // 2026/10/15 版本保存的名字没有统一全角/半角：改用统一后的名字，并把旧写法文件里的记录合并过来
-      const legacy = [...new Set([acc, legacyAccount(player.name)])].filter((n) => n && n !== cleanAccount(n) && cleanAccount(n) === cleanAccount(acc));
-      if (acc !== cleanAccount(acc)) {
-        acc = cleanAccount(acc);
-        accounts[player.name] = acc;
-        store.set('accounts', accounts);
-      }
-      const migrated = store.get('migrated', []);
-      const pending = legacy.filter((old) => !migrated.includes(old + '>' + acc));
       say('正在同步…');
-      for (const old of pending) {
-        const { data } = await syncGet(old);
-        if (data && data.obs) hist = mergeHist(migrateHist(data), hist);
-      }
       hist = await syncMerge(acc, hist);
       saveLocalHist(player.name, hist);
+      const migrated = store.get('migrated', []);
       if (pending.length) store.set('migrated', migrated.concat(pending.map((old) => old + '>' + acc)));
       syncNote = '历史记录已同步（chunithm/' + acc + '）' + note;
     } catch (e) {
