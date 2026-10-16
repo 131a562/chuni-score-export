@@ -168,6 +168,11 @@
     return checkHtml(await res.text());
   };
 
+  // 调试样本里把表单的 token 打码（token 和登录状态有关，不要发给别人）
+  const redact = (html) => html
+    .replace(/(name="token"[^>]*value=")[^"]*/g, '$1***')
+    .replace(/(value=")[^"]*("[^>]*name="token")/g, '$1***$2');
+
   // 解析带 sendMusicDetail 表单的曲目列表（rating 页面和全曲成绩页面结构相同）
   // 返回的数组带 total：页面上的曲目条目数（含没打过的），用来判断这个页面是否解析成功
   const parseSongList = (doc) => {
@@ -192,7 +197,7 @@
     list.total = forms.length;
     if (typeof listSample === 'string' && (!listSample || !/fullcombo|alljustice/i.test(listSample))) {
       const f = [...forms].find((x) => /fullcombo|alljustice/i.test(x.innerHTML)) || [...forms].find((x) => x.querySelector('.play_musicdata_highscore'));
-      if (f) listSample = f.outerHTML.replace(/s+/g, ' ').slice(0, 3000);
+      if (f) listSample = redact(f.outerHTML.replace(/\s+/g, ' ')).slice(0, 3000);
     }
     return list;
   };
@@ -357,7 +362,10 @@
       const newPath = ['ratingDetailNew', 'ratingDetailRecent'].find((p) => links.some((l) => l && l.includes(p))) || 'ratingDetailRecent';
       if (aborted) return;
       say('正在读取 BEST 枠…');
-      best = parseSongList(await fetchDoc(URL_PLAYER + 'ratingDetailBest/'));
+      const bdoc = await fetchDoc(URL_PLAYER + 'ratingDetailBest/');
+      const bf = bdoc.querySelector('form[action*="sendMusicDetail"]');
+      if (bf) ratingSample = redact(bf.outerHTML.replace(/\s+/g, ' ')).slice(0, 3000);
+      best = parseSongList(bdoc);
       if (aborted) return;
       say('正在读取新曲枠…');
       news = parseSongList(await fetchDoc(URL_PLAYER + newPath + '/'));
@@ -419,6 +427,8 @@
   let syncNote = '';
   let playlogSample = ''; // 调试用：プレイ履歴第一条的原始 HTML
   let listSample = '';    // 调试用：全曲成绩列表里一首带 FC/AJ 标记（没有就取有成绩）的歌的原始 HTML
+  let ratingSample = '';  // 调试用：B50（ratingDetailBest）页面第一首歌的原始 HTML（看有没有直接写单曲 Rating）
+  let playlogFirstForm = null; // プレイ履歴第一条的「詳細を見る」表单（调试信息里打开游玩详情用，不输出）
   let lastRun = null;     // 最近一次读到的数据，「更改同步名字」「从现在重新开始记录」时复用
 
   const pad2 = (n) => String(n).padStart(2, '0');
@@ -473,7 +483,8 @@
     if (titles.length) {
       let el = titles[0].parentElement;
       while (el && el.parentElement && !el.querySelector('.play_datalist_date')) el = el.parentElement;
-      playlogSample = el ? el.outerHTML.replace(/\s+/g, ' ').slice(0, 3000) : '';
+      playlogSample = el ? redact(el.outerHTML.replace(/\s+/g, ' ')).slice(0, 3000) : '';
+      playlogFirstForm = el ? el.querySelector('form[action*="laylog"]') : null;
     }
     if (!titles.length || dates.length !== titles.length || diffs.length !== titles.length || scores.length !== titles.length) return [];
     const names = ['basic', 'advanced', 'expert', 'master', 'ultima'];
@@ -911,6 +922,19 @@
 
   if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating, loadConstDb, resolveChart, fixPlayKeys };
 
+  // 打开プレイ履歴第一条的「詳細を見る」，返回页面主要内容（打码后）。看游玩详情上有没有游玩后的 Rating
+  async function readPlaylogDetailSample() {
+    if (TEST || !playlogFirstForm) return null;
+    try {
+      const body = new URLSearchParams();
+      playlogFirstForm.querySelectorAll('input[name]').forEach((i) => body.set(i.name, i.value));
+      const doc = await fetchDoc(new URL(playlogFirstForm.getAttribute('action'), BASE).href, { method: 'POST', body });
+      doc.querySelectorAll('script, style, header, footer, nav').forEach((x) => x.remove());
+      const main = doc.querySelector('.frame01, .box01, #inner, .wrapper') || doc.body;
+      return redact((main ? main.outerHTML : '').replace(/\s+/g, ' ')).slice(0, 6000);
+    } catch (e) { return '读取失败：' + e.message; }
+  }
+
   // ---------- 历史走势 ----------
   // 最近一次读到的历史（任何功能运行后都会更新）。从菜单再进「历史走势」时直接用它，不用重新读取
   let histView = null;
@@ -987,6 +1011,8 @@
         lamps: lastRun && lastRun.all ? lastRun.all.filter((s) => s.lamp).length : null,
         playlogSample,
         listSample,
+        ratingSample,
+        playlogDetailSample: await readPlaylogDetailSample(),
         history: { since: hist.since, snaps: hist.snaps.length, obs: hist.obs.length, plays: hist.obs.filter((o) => o.src === 'p').length, updates: updates.length, syncNote },
       }, null, 1);
       let ta = info.querySelector('textarea');
@@ -1400,7 +1426,8 @@
           hi = Math.min(hi, r1 * 50 + 49 - total);
           if (lo > hi) { lo = hi = base + frac; gap = r1 - Math.floor((base + frac + total) / 50); }
         }
-        t0 = Math.min(hi, Math.max(lo, base + frac));
+        // 计算出的余数不在可行范围里时取范围的中间（贴着边界会让进位系统性地偏早或偏晚）
+        t0 = base + frac >= lo && base + frac <= hi ? base + frac : Math.floor((lo + hi) / 2);
       }
       let cur = t0;
       steps.forEach((x, k) => {
