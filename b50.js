@@ -168,9 +168,10 @@
   };
 
   // 解析带 sendMusicDetail 表单的曲目列表（rating 页面和全曲成绩页面结构相同）
+  // 返回的数组带 total：页面上的曲目条目数（含没打过的），用来判断这个页面是否解析成功
   const parseSongList = (doc) => {
     const forms = doc.querySelectorAll('form[action*="sendMusicDetail"]');
-    return [...forms].map((f) => {
+    const list = [...forms].map((f) => {
       const val = (n) => (f.querySelector('input[name="' + n + '"]') || {}).value;
       const hs = f.querySelector('.play_musicdata_highscore');
       const scoreEl = (hs && hs.querySelector('.text_b')) || f.querySelector('.text_b') || hs;
@@ -187,6 +188,8 @@
         lamp,
       };
     }).filter((s) => s.idx != null && s.score > 0);
+    list.total = forms.length;
+    return list;
   };
 
   let constDb = null;
@@ -194,16 +197,34 @@
     if (constDb) return constDb;
     say('正在下载谱面定数表（otoge-db，约 3MB）…');
     const db = await fetch(CONST_URL).then((r) => { if (!r.ok) throw new Error('定数表下载失败 ' + r.status); return r.json(); });
+    const group = (key) => {
+      const map = new Map();
+      db.forEach((m) => { const k = key(m); if (k) { if (!map.has(k)) map.set(k, []); map.get(k).push(m); } });
+      return map;
+    };
+    const titleList = group((m) => normTitle(m.title));
     constDb = {
       byId: new Map(db.map((m) => [String(m.id), m])),
-      byTitle: new Map(db.map((m) => [m.title, m])),
+      // 同名的 WORLD'S END 谱面（例：Oshama Scramble! 的「改」）排在后面，按曲名查时优先普通谱面
+      byTitle: new Map([...titleList].map(([k, l]) => [k, l.find((m) => !isWE(m)) || l[0]])),
       byImage: new Map(db.filter((m) => m.image).map((m) => [m.image, m])),
+      titleList,
+      imageList: group((m) => m.image),
     };
     return constDb;
   };
+  const isWE = (m) => !!(m.we_kanji || m.catname === "WORLD'S END");
+  // 按曲绘 / 曲名找谱面：排除 WORLD'S END，并且要有这个难度（同名曲很多，例：Oshama Scramble! 有普通谱面和 WORLD'S END「改」）
+  const resolveChart = (db, title, d, img) => {
+    const ok = (m) => m && !isWE(m) && DIFFS[d] && m['lev_' + DIFFS[d].key];
+    const pick = (list) => (list || []).find(ok);
+    if (db.titleList) return (img && pick(db.imageList.get(img))) || pick(db.titleList.get(normTitle(title))) || null;
+    const m = (img && db.byImage.get(img)) || db.byTitle.get(title) || db.byTitle.get(normTitle(title));
+    return ok(m) ? m : null;
+  };
   const enrich = (s, db) => {
     if (s.constant != null) return s;
-    const m = db.byId.get(String(s.idx)) || db.byTitle.get(s.title);
+    const m = db.byId.get(String(s.idx)) || resolveChart(db, s.title, s.diff);
     const d = DIFFS[s.diff] || DIFFS[3];
     let c = m ? parseFloat(m['lev_' + d.key + '_i']) : NaN;
     let estimated = false;
@@ -237,6 +258,7 @@
     const pageToken = (gdoc.querySelector('input[name="token"]') || {}).value;
     const token = pageToken || (cookieToken && decodeURIComponent(cookieToken));
     const out = [];
+    out.pages = {}; // 难度 → 页面上的曲目条目数（含没打过的）。> 0 说明这个难度的页面解析成功
     for (const d of diffs) {
       if (aborted) return out;
       const name = DIFFS[d].name;
@@ -249,7 +271,12 @@
       if (token) body.set('token', token);
       let list = [];
       try { list = parseSongList(await fetchDoc(action, { method: 'POST', body })); } catch (e) { if (/登录|维护/.test(e.message)) throw e; }
-      if (!list.length) list = parseSongList(await fetchDoc(BASE + 'record/musicGenre/' + name.toLowerCase()));
+      let total = list.total || 0;
+      if (!list.length) {
+        list = parseSongList(await fetchDoc(BASE + 'record/musicGenre/' + name.toLowerCase()));
+        total = Math.max(total, list.total || 0);
+      }
+      out.pages[d] = total;
       // 列表页的 diff 值可能缺失，这里统一以当前难度为准
       list.forEach((s) => { s.diff = d; });
       out.push(...list);
@@ -446,7 +473,7 @@
       if (d < 2 || !t || !s) return null;
       const n = te.textContent.trim();
       const img = jackets.length === titles.length ? (jackets[i].getAttribute('src') || '').split('/').pop().split('?')[0] : '';
-      const m = (img && db.byImage.get(img)) || db.byTitle.get(n);
+      const m = resolveChart(db, n, d, img);
       const o = { t, k: m ? songKey(m.id, d) : 'n:' + n + ':' + d, n, d, s, src: 'p' };
       // NEW RECORD 和这次的标记：只在能确定所属条目时读取
       let box = te.parentElement;
@@ -520,13 +547,28 @@
     out.since = [a.since, b.since].filter(Boolean).sort()[0] || '';
     if (out.resetAt > out.since) out.since = out.resetAt;
     const seen = new Set();
-    [...a.obs, ...b.obs].forEach((o) => { const id = obsId(o); if (!seen.has(id)) { seen.add(id); out.obs.push(o); } });
+    // 同一条记录两边都有时以 b（本机，已经重新对应过谱面）为准
+    [...b.obs, ...a.obs].forEach((o) => { const id = obsId(o); if (!seen.has(id)) { seen.add(id); out.obs.push(o); } });
     out.obs = out.obs.filter((o) => o.t >= out.since).sort(byTime);
     const snaps = new Map();
     [...a.snaps, ...b.snaps].forEach((s) => snaps.set(s.t, s));
     out.snaps = [...snaps.values()].filter((s) => s.t >= out.since).sort(byTime);
     out.scans = [...new Set([...(a.scans || []), ...(b.scans || [])])].filter((x) => x >= out.since).sort();
     return out;
+  };
+
+  // プレイ履歴的游玩重新对应谱面：旧版本按曲名对应时，同名曲会对应到 WORLD'S END 谱面（没有定数，
+  // 例：Oshama Scramble! → 「改」），或者对应不到（k = n:曲名:难度）。成绩扫描的记录用的是 CHUNITHM-NET 的曲目 id，不用改
+  const fixPlayKeys = (hist, db) => {
+    if (!db || !db.titleList) return hist;
+    hist.obs.forEach((o) => {
+      if (o.src !== 'p') return;
+      const cur = o.k.startsWith('n:') ? null : db.byId.get(o.k.split(':')[0]);
+      if (cur && !isWE(cur) && DIFFS[o.d] && cur['lev_' + DIFFS[o.d].key]) return;
+      const m = resolveChart(db, o.n, o.d);
+      if (m) o.k = songKey(m.id, o.d);
+    });
+    return hist;
   };
 
   const sameSnap = (a, b) => a && b && a.r === b.r &&
@@ -728,9 +770,10 @@
         note += '（全曲成绩读取失败，只用 rating 页面）';
       }
     }
-    // 只把真的读到了成绩的难度当作「完整扫描过」：某个难度的页面解析失败（空列表）时，
-    // 不能让下一次扫描把这个难度的全部谱面误判成「首次」
-    if (all && scanDiffs) scanDiffs = scanDiffs.filter((d) => all.some((s) => s.diff === d));
+    // 只把页面解析成功的难度当作「完整扫描过」：页面上有曲目条目（含没打过的）就算，
+    // 一首都没打过的难度（例：从没打过 ULTIMA）也算扫描过，之后第一次打的才能算「首次」。
+    // 页面解析失败（一个条目都没有）时不算，免得下一次扫描把这个难度的全部谱面误判成「首次」
+    if (all && scanDiffs) scanDiffs = scanDiffs.filter((d) => (all.pages ? all.pages[d] > 0 : all.some((s) => s.diff === d)));
     lastRun = { player, best, news, all, db, scanDiffs };
     let plays = [];
     try {
@@ -782,6 +825,7 @@
       } catch (e) { syncErr = e; }
     }
 
+    fixPlayKeys(local, db);
     // 只记「上一次查询之后」的游玩（第一次 = 起点，之前的游玩都不记）。
     // 上一次查询时间 = 历史里最后一个快照 / 成绩扫描的时间。和上次同一分钟的游玩按「时间 + 曲名 + 难度 + 分数」去重
     const lastQuery = [...local.snaps.map((x) => x.t), ...local.obs.filter((o) => o.src === 'b').map((o) => o.t)].sort().pop() || '';
@@ -841,7 +885,7 @@
     f.appendChild(back);
   }
 
-  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating };
+  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating, loadConstDb, resolveChart, fixPlayKeys };
 
   // ---------- 历史走势 ----------
   async function runHistory() {
@@ -901,6 +945,10 @@
       const info = JSON.stringify({
         ua: navigator.userAgent,
         scanned: lastRun && lastRun.all ? lastRun.all.length : null,
+        scanPages: lastRun && lastRun.all ? lastRun.all.pages || null : null,
+        scanByDiff: lastRun && lastRun.all ? [2, 3, 4].map((d) => DIFFS[d].short + ':' + lastRun.all.filter((s) => s.diff === d).length).join(' ') : null,
+        scanDiffs: lastRun ? lastRun.scanDiffs : null,
+        unresolvedPlays: hist.obs.filter((o) => o.src === 'p' && o.k.startsWith('n:')).map((o) => o.n + ' ' + DIFFS[o.d].short).slice(0, 20),
         lamps: lastRun && lastRun.all ? lastRun.all.filter((s) => s.lamp).length : null,
         playlogSample,
         history: { since: hist.since, snaps: hist.snaps.length, obs: hist.obs.length, plays: hist.obs.filter((o) => o.src === 'p').length, updates: updates.length, syncNote },
