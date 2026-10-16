@@ -189,6 +189,10 @@
       };
     }).filter((s) => s.idx != null && s.score > 0);
     list.total = forms.length;
+    if (typeof listSample === 'string' && (!listSample || !/fullcombo|alljustice/i.test(listSample))) {
+      const f = [...forms].find((x) => /fullcombo|alljustice/i.test(x.innerHTML)) || [...forms].find((x) => x.querySelector('.play_musicdata_highscore'));
+      if (f) listSample = f.outerHTML.replace(/s+/g, ' ').slice(0, 3000);
+    }
     return list;
   };
 
@@ -411,6 +415,7 @@
   // 当前最佳和每一次推分都由 obs 按时间重放得出，所以多台设备的数据合并时只需取并集。
   let syncNote = '';
   let playlogSample = ''; // 调试用：プレイ履歴第一条的原始 HTML
+  let listSample = '';    // 调试用：全曲成绩列表里一首带 FC/AJ 标记（没有就取有成绩）的歌的原始 HTML
   let lastRun = null;     // 最近一次读到的数据，「更改同步名字」「从现在重新开始记录」时复用
 
   const pad2 = (n) => String(n).padStart(2, '0');
@@ -472,7 +477,9 @@
       const s = parseInt(scores[i].textContent.replace(/[^0-9]/g, ''), 10) || 0;
       if (d < 2 || !t || !s) return null;
       const n = te.textContent.trim();
-      const img = jackets.length === titles.length ? (jackets[i].getAttribute('src') || '').split('/').pop().split('?')[0] : '';
+      // 曲绘是延迟加载的（<img class="lazy" data-original="…/img/xxxx.jpg">），没有 src
+      const jsrc = jackets.length === titles.length ? jackets[i].getAttribute('data-original') || jackets[i].getAttribute('src') || '' : '';
+      const img = jsrc.split('/').pop().split('?')[0];
       const m = resolveChart(db, n, d, img);
       const o = { t, k: m ? songKey(m.id, d) : 'n:' + n + ':' + d, n, d, s, src: 'p' };
       // NEW RECORD 和这次的标记：只在能确定所属条目时读取
@@ -480,7 +487,8 @@
       while (box && !box.querySelector('.play_datalist_date')) box = box.parentElement;
       if (box && box.querySelectorAll('.play_musicdata_title').length === 1) {
         const icons = [...box.querySelectorAll('img')].map((x) => x.getAttribute('src') || '').join(' ');
-        if (/new_?record/i.test(icons)) o.nr = 1;
+        // NEW RECORD：分数旁边 .play_musicdata_score_img 里的 icon_new.png
+        if (box.querySelector('.play_musicdata_score_img img[src*="new"]') || /new_?record/i.test(icons)) o.nr = 1;
         const l = lampFromIcons(icons);
         if (l) o.l = s >= 1010000 && l === 'AJ' ? 'AJC' : l;
       }
@@ -588,7 +596,15 @@
       if (!hist.scans.includes(mark)) hist.scans.push(mark);
     }
     const ids = new Set(hist.obs.map(obsId));
-    (plays || []).forEach((o) => { if (!ids.has(obsId(o))) { ids.add(obsId(o)); hist.obs.push(o); } });
+    const byId = new Map(hist.obs.filter((o) => o.src === 'p').map((o) => [obsId(o), o]));
+    (plays || []).forEach((o) => {
+      const old = byId.get(obsId(o));
+      if (!old) { if (!ids.has(obsId(o))) { ids.add(obsId(o)); hist.obs.push(o); } return; }
+      // 以前解析时没认出来的信息（旧版本没识别 NEW RECORD 的图标）：重新读到同一次游玩时补上
+      if (o.nr && !old.nr) old.nr = 1;
+      if (o.l && old.l == null) old.l = o.l;
+      if (old.k.startsWith('n:') && !o.k.startsWith('n:')) old.k = o.k;
+    });
     // 成绩扫描：第一次见到、分数或标记提升、或者补记以前没有的标记信息时记录
     const { state } = derive(hist);
     const scan = new Map();
@@ -829,7 +845,8 @@
     // 只记「上一次查询之后」的游玩（第一次 = 起点，之前的游玩都不记）。
     // 上一次查询时间 = 历史里最后一个快照 / 成绩扫描的时间。和上次同一分钟的游玩按「时间 + 曲名 + 难度 + 分数」去重
     const lastQuery = [...local.snaps.map((x) => x.t), ...local.obs.filter((o) => o.src === 'b').map((o) => o.t)].sort().pop() || '';
-    plays = lastQuery ? plays.filter((o) => o.t >= lastQuery) : [];
+    const stored = new Set(local.obs.filter((o) => o.src === 'p').map(obsId));
+    plays = lastQuery ? plays.filter((o) => o.t >= lastQuery || stored.has(obsId(o))) : [];
     let hist = applyUpdate(local, { player, best, news, all, plays, scanDiffs });
     const savedLocal = saveLocalHist(player.name, hist);
     syncNote = (savedLocal ? '历史记录已保存在本机' : '本机存储空间不足，历史记录未保存') + note;
@@ -951,6 +968,7 @@
         unresolvedPlays: hist.obs.filter((o) => o.src === 'p' && o.k.startsWith('n:')).map((o) => o.n + ' ' + DIFFS[o.d].short).slice(0, 20),
         lamps: lastRun && lastRun.all ? lastRun.all.filter((s) => s.lamp).length : null,
         playlogSample,
+        listSample,
         history: { since: hist.since, snaps: hist.snaps.length, obs: hist.obs.length, plays: hist.obs.filter((o) => o.src === 'p').length, updates: updates.length, syncNote },
       }, null, 1);
       let ta = p.querySelector('textarea');
