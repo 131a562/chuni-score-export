@@ -929,9 +929,15 @@
       const body = new URLSearchParams();
       playlogFirstForm.querySelectorAll('input[name]').forEach((i) => body.set(i.name, i.value));
       const doc = await fetchDoc(new URL(playlogFirstForm.getAttribute('action'), BASE).href, { method: 'POST', body });
-      doc.querySelectorAll('script, style, header, footer, nav').forEach((x) => x.remove());
-      const main = doc.querySelector('.frame01, .box01, #inner, .wrapper') || doc.body;
-      return redact((main ? main.outerHTML : '').replace(/\s+/g, ' ')).slice(0, 6000);
+      // 去掉菜单（#main_menu / #submenu 很长，会把真正的详情挤出截取范围），只留文字和图片文件名
+      doc.querySelectorAll('script, style, header, footer, nav, #main_menu, #submenu, form').forEach((x) => x.remove());
+      const main = doc.querySelector('.frame01') || doc.querySelector('#inner') || doc.body;
+      if (!main) return null;
+      return {
+        text: main.textContent.replace(/\s+/g, ' ').trim().slice(0, 3000),
+        imgs: [...main.querySelectorAll('img')].map((i) => (i.getAttribute('src') || i.getAttribute('data-original') || '').split('/').pop()).filter(Boolean).slice(0, 80),
+        classes: [...new Set([...main.querySelectorAll('[class]')].map((x) => x.className))].slice(0, 80),
+      };
     } catch (e) { return '读取失败：' + e.message; }
   }
 
