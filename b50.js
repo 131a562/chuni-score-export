@@ -351,7 +351,7 @@
       if (!all.length) throw new Error('没有读到成绩。需要开通 CHUNITHM-NET スタンダードコース，或页面结构已变更。');
     }
     const db = TEST ? TEST_DB : await loadConstDb();
-    await recordAndSync({ player, all, db });
+    await recordAndSync({ player, all, db, scanDiffs: opt.diffs });
     if (aborted) return;
     const eps = 1e-6;
     let list = all.map((s) => enrich(s, db))
@@ -375,11 +375,16 @@
   }
 
   // ---------- 历史记录 ----------
-  // 数据结构（history.json）：
-  //   obs:   观测记录 {t:'YYYY/MM/DD HH:MM', k:'曲目id:难度', n:曲名, d:难度, s:分数, src:'p'(プレイ履歴)|'b'(成绩扫描), nr:1(NEW RECORD)}
-  //   snaps: Rating 快照 {t, r:Rating, b30, n20, best:[[k,n,s]], news:[[k,n,s]]}
-  // 个人最佳和更新记录都由 obs 按时间重放得出，多设备合并时只需取并集。
+  // 规则与 ongeki-score-export / maimai-dx-score 保持一致。数据结构（history.json）：
+  //   since: 起点（第一次记录的时间）。起点之前的游玩不知道当时的最佳是多少，统计会出错，所以不记
+  //   obs:   观测记录 {t:'YYYY/MM/DD HH:MM', k:'曲目id:难度', n:曲名, d:难度, s:分数, src:'p'(プレイ履歴)|'b'(成绩扫描),
+  //            nr:1(NEW RECORD), l:''|'FC'|'AJ'|'AJC'(标记)}
+  //          l 缺省 = 这条记录没有标记信息（旧版本的记录、或プレイ履歴里读不到）。「没有 → 有」只是补记，不算推分
+  //   snaps: Rating 快照 {t, r:Rating, b30, n20, best/news:[[k, 曲名, 分数, 单曲 Rating(0.01 单位), 标记]]}
+  // 当前最佳和每一次推分都由 obs 按时间重放得出，所以多台设备的数据合并时只需取并集。
   let syncNote = '';
+  let playlogSample = ''; // 调试用：プレイ履歴第一条的原始 HTML
+  let lastRun = null;     // 最近一次读到的数据，「更改同步名字」「从现在重新开始记录」时复用
 
   const pad2 = (n) => String(n).padStart(2, '0');
   const nowStr = () => {
@@ -396,9 +401,27 @@
   };
   const byTime = (a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0);
   const songKey = (idx, diff) => idx + ':' + diff;
-  const emptyHist = () => ({ v: 1, name: '', obs: [], snaps: [] });
+  const normTitle = (s) => String(s).normalize('NFKC').replace(/\s+/g, ' ').trim();
+  // v3：加了起点 since。v2 以前的记录不丢弃：把第一次成绩扫描的时间当作起点，丢掉起点之前的游玩（见 migrateHist）
+  const HIST_V = 3;
+  // scans：每次完整全曲扫描的时间和覆盖的难度，'YYYY/MM/DD HH:MM|2,3,4'。
+  //   起点之后才第一次出现的谱面，如果之前已经有覆盖这个难度的完整扫描（那时还没打过），就是新打的，算推分（首次）
+  const emptyHist = () => ({ v: HIST_V, game: 'chunithm', name: '', since: '', obs: [], snaps: [], scans: [] });
+  function migrateHist(h) {
+    if (!h || !h.obs) return emptyHist();
+    if (h.v === HIST_V) return h;
+    const firstScan = h.obs.filter((o) => o.src === 'b').map((o) => o.t).sort()[0] || '';
+    const since = firstScan || h.snaps.map((s) => s.t).sort()[0] || '';
+    return { ...h, v: HIST_V, game: 'chunithm', since, obs: h.obs.filter((o) => o.t >= since), snaps: h.snaps.filter((s) => s.t >= since) };
+  }
+  // 同一次游玩 = 时间 + 曲名 + 难度 + 分数（不看曲目 id，id 对应方式变了也能去重）
+  const playId = (o) => o.t + '|' + normTitle(o.n) + '|' + o.d + '|' + o.s;
+  // 旧版本的记录没有 l 字段，id 只在有标记信息时才追加，保证和旧记录去重一致
+  const obsId = (o) => (o.src === 'p' ? 'p|' + playId(o) : [o.t, o.k, o.s, o.src].join('|') + (o.l != null ? '|l' + o.l : ''));
+  const LAMP_RANK = { '': 0, FC: 1, AJ: 2, AJC: 3 };
+  const lampFromIcons = (icons) => (/alljusticecritical|_ajc/i.test(icons) ? 'AJC' : /alljustice/i.test(icons) ? 'AJ' : /fullcombo/i.test(icons) ? 'FC' : '');
 
-  // プレイ履歴（最近 50 次游玩）。各字段按出现顺序一一对应，与 chu2view 的解析方式相同
+  // プレイ履歴（最近 50 次游玩）。各字段按出现顺序一一对应，与 chu2view 的解析方式相同。只记 EXPERT 以上
   const parsePlaylog = (doc, db) => {
     const all = (sel) => [...doc.querySelectorAll(sel)];
     const titles = all('.play_musicdata_title');
@@ -406,6 +429,11 @@
     const diffs = all('.play_track_result img');
     const scores = all('.play_musicdata_score_text');
     const jackets = all('.play_jacket_img img');
+    if (titles.length) {
+      let el = titles[0].parentElement;
+      while (el && el.parentElement && !el.querySelector('.play_datalist_date')) el = el.parentElement;
+      playlogSample = el ? el.outerHTML.replace(/\s+/g, ' ').slice(0, 3000) : '';
+    }
     if (!titles.length || dates.length !== titles.length || diffs.length !== titles.length || scores.length !== titles.length) return [];
     const names = ['basic', 'advanced', 'expert', 'master', 'ultima'];
     return titles.map((te, i) => {
@@ -413,80 +441,135 @@
       const d = dm ? names.indexOf(dm[1].toLowerCase()) : -1;
       const t = normTime(dates[i].textContent);
       const s = parseInt(scores[i].textContent.replace(/[^0-9]/g, ''), 10) || 0;
-      if (d < 0 || !t || !s) return null;
+      if (d < 2 || !t || !s) return null;
       const n = te.textContent.trim();
       const img = jackets.length === titles.length ? (jackets[i].getAttribute('src') || '').split('/').pop().split('?')[0] : '';
       const m = (img && db.byImage.get(img)) || db.byTitle.get(n);
-      // NEW RECORD 标记：只在能确定所属条目时读取
+      const o = { t, k: m ? songKey(m.id, d) : 'n:' + n + ':' + d, n, d, s, src: 'p' };
+      // NEW RECORD 和这次的标记：只在能确定所属条目时读取
       let box = te.parentElement;
       while (box && !box.querySelector('.play_datalist_date')) box = box.parentElement;
-      const nr = box && box.querySelectorAll('.play_musicdata_title').length === 1 &&
-        [...box.querySelectorAll('img')].some((x) => /new_?record/i.test(x.getAttribute('src') || ''));
-      const o = { t, k: m ? songKey(m.id, d) : 'n:' + n + ':' + d, n, d, s, src: 'p' };
-      if (nr) o.nr = 1;
+      if (box && box.querySelectorAll('.play_musicdata_title').length === 1) {
+        const icons = [...box.querySelectorAll('img')].map((x) => x.getAttribute('src') || '').join(' ');
+        if (/new_?record/i.test(icons)) o.nr = 1;
+        const l = lampFromIcons(icons);
+        if (l) o.l = s >= 1010000 && l === 'AJ' ? 'AJC' : l;
+      }
       return o;
     }).filter(Boolean);
   };
 
-  const obsId = (o) => o.t + '|' + o.k + '|' + o.s + '|' + o.src;
+  // 某首歌在某一时刻的最佳状态 {s, l, has:{l}}。合并一条观测，返回这次带来的变化
+  const blankState = () => ({ s: 0, l: '', has: { l: false } });
+  function absorb(state, o) {
+    const ch = [];
+    const next = { ...state, has: { ...state.has } };
+    if (o.s > state.s) { ch.push({ type: 'score', from: state.s, to: o.s }); next.s = o.s; }
+    let l = state.l;
+    if (o.l != null) {
+      if (LAMP_RANK[o.l] > LAMP_RANK[l]) l = o.l;
+      next.has.l = true;
+    }
+    // AJC 只由分数理论值决定：分数到 1,010,000 且已有 AJ 时，标记跟着升级
+    if (next.has.l && next.s >= 1010000 && l === 'AJ') l = 'AJC';
+    if (l !== state.l && state.has.l) ch.push({ type: 'lamp', from: state.l, to: l });
+    next.l = l;
+    return { next, ch };
+  }
 
-  // 按时间重放观测记录，得到每首歌的当前最佳和每一次个人最佳的更新
-  const derive = (hist) => {
-    const pb = {}, log = [];
+  // 按时间重放观测记录：每首歌的当前状态、每一次推分（before / after 状态和具体变化）
+  // 一首谱面先要被成绩扫描记录过最佳，之后的提升才算推分；在那之前，只有游戏标了 NEW RECORD 的游玩才算
+  // （否则プレイ履歴里没刷新的旧游玩会被当成「旧最佳」，扫描到真正的最佳时就误记成推分）。
+  // 第一次出现的谱面：之前已有覆盖这个难度的完整全曲扫描、而那次扫描里没有它 → 那时还没打过，这次是新打的，算推分（首次）。
+  // 起点那次扫描本身（之前没有完整扫描）里的谱面都只当起点。プレイ履歴里对应不到曲目 id 的（k 以 n: 开头）不按首次算，避免误判
+  function derive(hist) {
+    const state = {}, pb = {}, scanned = new Set(), updates = [];
+    const fullScans = (hist.scans || []).map((x) => { const [t, ds] = x.split('|'); return { t, ds: (ds || '').split(',').map(Number) }; });
+    const newChart = (o) => !o.k.startsWith('n:') && fullScans.some((f) => f.t < o.t && f.ds.includes(o.d));
+    const fresh = new Set(); // 新打的谱面：最佳从 0 开始是确定的，之后的提升也都算推分（同 ongeki-score-export）
     hist.obs.slice().sort(byTime).forEach((o) => {
-      const p = pb[o.k];
-      if (p == null) {
-        pb[o.k] = o.s;
-        if (o.src === 'p' && o.nr) log.push({ ...o, f: null });
-      } else if (o.s > p) {
-        pb[o.k] = o.s;
-        log.push({ ...o, f: p });
+      const before = state[o.k];
+      if (!before && newChart(o)) fresh.add(o.k);
+      const known = scanned.has(o.k) || fresh.has(o.k);
+      if (o.src === 'b') scanned.add(o.k);
+      if (!before) {
+        state[o.k] = absorb(blankState(), o).next;
+        if ((o.src === 'p' && o.nr) || fresh.has(o.k)) {
+          const ch = [{ type: 'score', from: null, to: o.s }];
+          if (state[o.k].l) ch.push({ type: 'lamp', from: null, to: state[o.k].l });
+          updates.push({ ...o, before: null, after: state[o.k], changes: ch });
+        }
+      } else {
+        const { next, ch } = absorb(before, o);
+        state[o.k] = next;
+        if (ch.length && (known || (o.src === 'p' && o.nr))) updates.push({ ...o, before, after: next, changes: ch });
       }
+      pb[o.k] = state[o.k].s;
     });
-    return { pb, log };
-  };
+    return { state, pb, updates };
+  }
 
   const mergeHist = (a, b) => {
     const out = emptyHist();
     out.name = b.name || a.name;
+    // 起点取较晚的（在某台设备上「从现在重新开始记录」后，别的设备上起点之前的记录也一起丢掉）
+    out.since = [a.since || '', b.since || ''].sort().pop();
     const seen = new Set();
     [...a.obs, ...b.obs].forEach((o) => { const id = obsId(o); if (!seen.has(id)) { seen.add(id); out.obs.push(o); } });
-    out.obs.sort(byTime);
+    out.obs = out.obs.filter((o) => o.t >= out.since).sort(byTime);
     const snaps = new Map();
     [...a.snaps, ...b.snaps].forEach((s) => snaps.set(s.t, s));
-    out.snaps = [...snaps.values()].sort(byTime);
+    out.snaps = [...snaps.values()].filter((s) => s.t >= out.since).sort(byTime);
+    out.scans = [...new Set([...(a.scans || []), ...(b.scans || [])])].filter((x) => x >= out.since).sort();
     return out;
   };
 
   const sameSnap = (a, b) => a && b && a.r === b.r &&
     JSON.stringify(a.best) === JSON.stringify(b.best) && JSON.stringify(a.news) === JSON.stringify(b.news);
 
-  // 把本次读到的数据并入历史
-  const applyUpdate = (hist, { player, best, news, all, plays }) => {
+  // 把本次读到的数据并入历史。all = 全曲成绩扫描（带标记），best/news = rating 页面（不带标记）
+  //   scanDiffs：all 覆盖了哪些难度（完整读完的难度），记进 hist.scans
+  const applyUpdate = (hist, { player, best, news, all, plays, scanDiffs }) => {
     const t = nowStr();
     if (player && player.name) hist.name = player.name;
+    hist.v = HIST_V;
+    hist.game = 'chunithm';
+    if (!hist.since) hist.since = t; // 起点：这次的成绩扫描和快照就是历史的开始
+    hist.scans = hist.scans || [];
+    if (all && scanDiffs && scanDiffs.length) {
+      const mark = t + '|' + scanDiffs.slice().sort().join(',');
+      if (!hist.scans.includes(mark)) hist.scans.push(mark);
+    }
     const ids = new Set(hist.obs.map(obsId));
     (plays || []).forEach((o) => { if (!ids.has(obsId(o))) { ids.add(obsId(o)); hist.obs.push(o); } });
-    // 成绩扫描：只有比已知最佳更高（或第一次见到）时才记录，避免每次重复写入
-    const { pb } = derive(hist);
-    const scanned = [...(best || []), ...(news || []), ...(all || [])];
-    const done = new Set();
-    scanned.forEach((s) => {
-      const k = songKey(s.idx, s.diff);
-      if (done.has(k)) return;
-      done.add(k);
-      if (pb[k] == null || s.score > pb[k]) hist.obs.push({ t, k, n: s.title, d: s.diff, s: s.score, src: 'b' });
+    // 成绩扫描：第一次见到、分数或标记提升、或者补记以前没有的标记信息时记录
+    const { state } = derive(hist);
+    const scan = new Map();
+    [...(best || []), ...(news || [])].forEach((s) => scan.set(songKey(s.idx, s.diff), { s, lamp: false }));
+    (all || []).forEach((s) => scan.set(songKey(s.idx, s.diff), { s, lamp: true }));
+    const lampByKey = new Map();
+    scan.forEach(({ s, lamp }, k) => {
+      const o = { t, k, n: s.title, d: s.diff, s: s.score, src: 'b' };
+      if (lamp) { o.l = s.lamp || ''; lampByKey.set(k, o.l); }
+      const old = state[k];
+      if (!old) { hist.obs.push(o); return; }
+      const { ch } = absorb(old, o);
+      if (ch.length || (o.l != null && !old.has.l)) hist.obs.push(o);
     });
     hist.obs.sort(byTime);
     if (best && news) {
       const sum = (l) => l.reduce((a, s) => a + s.rating, 0);
+      const row = (s) => {
+        const k = songKey(s.idx, s.diff);
+        return [k, s.title, s.score, Math.floor(s.rating * 100 + 1e-6), lampByKey.has(k) ? lampByKey.get(k) : null];
+      };
       const snap = {
         t,
         r: parseFloat(player.rating) || Math.floor((sum(best) + sum(news)) / 50 * 100) / 100,
         b30: best.length ? Math.round(sum(best) / best.length * 10000) / 10000 : 0,
         n20: news.length ? Math.round(sum(news) / news.length * 10000) / 10000 : 0,
-        best: best.map((s) => [songKey(s.idx, s.diff), s.title, s.score]),
-        news: news.map((s) => [songKey(s.idx, s.diff), s.title, s.score]),
+        best: best.map(row),
+        news: news.map(row),
       };
       // 和上一次完全相同且在同一天就不重复记录
       const last = hist.snaps[hist.snaps.length - 1];
@@ -506,13 +589,13 @@
         try { localStorage.removeItem('b50:hist'); } catch (e) { /* 忽略 */ }
       }
     }
-    return h && h.obs ? h : emptyHist();
+    return migrateHist(h);
   };
   const saveLocalHist = (playerName, h) => {
     try { localStorage.setItem('b50:hist:' + playerName, JSON.stringify(h)); return true; } catch (e) { return false; }
   };
 
-  // ---- 同步（经由 Cloudflare Worker 读写 GitHub 私有仓库的 users/<玩家名>.json）----
+  // ---- 同步（经由 otoge-sync 读写 GitHub 私有仓库 otoge-history 的 chunithm/<玩家名>.json）----
   // 「玩家名」= 同步时存入的名字，默认是 CHUNITHM 的玩家名；同一个人换设备时填相同的名字即可接着同步
   // 统一写法，避免同一个名字因输入方式不同存成两个文件：
   // NFKC 把全角英数字/符号/空格转成半角、半角片假名转成全角；英文字母统一大写（CHUNITHM 玩家名本来就是大写）
@@ -535,7 +618,7 @@
   const syncFetch = async (acc, suffix, init) => {
     let res;
     try {
-      res = await fetch(SYNC_URL.replace(/\/+$/, '') + '/users/' + encodeURIComponent(acc) + (suffix || ''), Object.assign({ cache: 'no-store' }, init));
+      res = await fetch(SYNC_URL.replace(/\/+$/, '') + '/chunithm/' + encodeURIComponent(acc) + (suffix || ''), Object.assign({ cache: 'no-store' }, init));
     } catch (e) { throw new Error('连不上同步服务'); }
     if (res.status === 401 || res.status === 403 || res.status >= 500) {
       throw new Error('同步服务出错（HTTP ' + res.status + '），请联系书签提供者');
@@ -568,7 +651,8 @@
   const syncMerge = async (acc, local) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const { data, sha } = await syncGet(acc);
-      const merged = data && data.obs ? mergeHist(data, local) : local;
+      // 云端是旧版本（没有起点）的记录：先按起点转换再合并
+      const merged = data && data.obs ? mergeHist(migrateHist(data), local) : local;
       if (data && JSON.stringify(data) === JSON.stringify(merged)) return merged;
       // 写入冲突（别的设备刚好也在写）时重新读取再合并
       if (await syncPut(acc, merged, sha)) return merged;
@@ -621,56 +705,79 @@
     input.focus();
   });
 
-  // 读取プレイ履歴、并入历史、同步。任何一步失败都不影响出图，只在结果页提示
-  async function recordAndSync({ player, best, news, all, db }) {
+  // 读取全曲成绩和プレイ履歴、并入历史、同步。任何一步失败都不影响出图，只在结果页提示
+  //   opts.forceAsk：重新询问同步名字（「更改同步名字」）
+  //   opts.reset：清空历史，从现在重新开始（起点 = 这次）
+  async function recordAndSync({ player, best, news, all, db, scanDiffs }, opts) {
+    opts = opts || {};
+    let note = '';
+    // 每次都扫描 EXPERT / MASTER / ULTIMA 全曲成绩，分数和 FC/AJ 标记的提升都能记下来
+    if (!all) {
+      try {
+        all = TEST ? TEST.all : await readAllScores([2, 3, 4]);
+        scanDiffs = [2, 3, 4];
+      } catch (e) {
+        if (/登录|维护/.test(e.message)) throw e;
+        note += '（全曲成绩读取失败，只用 rating 页面）';
+      }
+    }
+    // 只把真的读到了成绩的难度当作「完整扫描过」：某个难度的页面解析失败（空列表）时，
+    // 不能让下一次扫描把这个难度的全部谱面误判成「首次」
+    if (all && scanDiffs) scanDiffs = scanDiffs.filter((d) => all.some((s) => s.diff === d));
+    lastRun = { player, best, news, all, db, scanDiffs };
     let plays = [];
-    let playNote = '';
     try {
       if (TEST) plays = TEST.plays || [];
       else {
         say('正在读取游玩记录…');
         plays = parsePlaylog(await fetchDoc(BASE + 'record/playlog/'), db);
-        if (!plays.length) playNote = '（未能解析游玩记录）';
+        if (!plays.length) note += '（未能解析游玩记录，只用成绩扫描）';
       }
     } catch (e) {
       if (/登录|维护/.test(e.message)) throw e;
-      playNote = '（游玩记录读取失败）';
+      note += '（游玩记录读取失败）';
     }
-    let hist = applyUpdate(loadLocalHist(player.name), { player, best, news, all, plays });
+    const local = opts.reset ? emptyHist() : loadLocalHist(player.name);
+    // 只记「上一次查询之后」的游玩（第一次 = 起点，之前的游玩都不记）。
+    // 上一次查询时间 = 历史里最后一个快照 / 成绩扫描的时间。和上次同一分钟的游玩按「时间 + 曲名 + 难度 + 分数」去重
+    const lastQuery = [...local.snaps.map((x) => x.t), ...local.obs.filter((o) => o.src === 'b').map((o) => o.t)].sort().pop() || '';
+    plays = lastQuery ? plays.filter((o) => o.t >= lastQuery) : [];
+    let hist = applyUpdate(local, { player, best, news, all, plays, scanDiffs });
     const savedLocal = saveLocalHist(player.name, hist);
-    syncNote = (savedLocal ? '历史记录已保存在本机' : '本机存储空间不足，历史记录未保存') + playNote;
+    syncNote = (savedLocal ? '历史记录已保存在本机' : '本机存储空间不足，历史记录未保存') + note;
     if (!SYNC_URL) return hist;
 
     const accounts = store.get('accounts', {});
-    let acc = accounts[player.name];
-    if (acc === undefined) {
-      acc = await askAccount(player);
-      // 选「暂不同步」也记下来，避免每次都问；可在「同步账号」里重新设置
-      accounts[player.name] = acc;
-      store.set('accounts', accounts);
-    }
-    if (!acc) { syncNote += '（未开启同步）'; return hist; }
-    // 旧版本保存的名字没有统一全角/半角：改用统一后的名字，并把旧写法文件里的记录合并过来
-    const legacy = [...new Set([acc, legacyAccount(player.name)])].filter((n) => n && n !== cleanAccount(n) && cleanAccount(n) === cleanAccount(acc));
-    if (acc !== cleanAccount(acc)) {
-      acc = cleanAccount(acc);
-      accounts[player.name] = acc;
-      store.set('accounts', accounts);
-    }
-    const migrated = store.get('migrated', []);
-    const pending = legacy.filter((old) => !migrated.includes(old + '>' + acc));
+    let acc = opts.forceAsk ? undefined : accounts[player.name];
     try {
+      if (acc === undefined) {
+        await syncFetch('_ping'); // 先确认连得上，连不上就不询问（错误会显示在结果页 / 历史页）
+        acc = await askAccount(player);
+        // 选「暂不同步」也记下来，避免每次都问；可在「历史走势」里「更改同步名字」
+        accounts[player.name] = acc;
+        store.set('accounts', accounts);
+      }
+      if (!acc) { syncNote += '（未开启云端同步）'; return hist; }
+      // 2026/10/15 版本保存的名字没有统一全角/半角：改用统一后的名字，并把旧写法文件里的记录合并过来
+      const legacy = [...new Set([acc, legacyAccount(player.name)])].filter((n) => n && n !== cleanAccount(n) && cleanAccount(n) === cleanAccount(acc));
+      if (acc !== cleanAccount(acc)) {
+        acc = cleanAccount(acc);
+        accounts[player.name] = acc;
+        store.set('accounts', accounts);
+      }
+      const migrated = store.get('migrated', []);
+      const pending = legacy.filter((old) => !migrated.includes(old + '>' + acc));
       say('正在同步…');
       for (const old of pending) {
         const { data } = await syncGet(old);
-        if (data && data.obs) hist = mergeHist(data, hist);
+        if (data && data.obs) hist = mergeHist(migrateHist(data), hist);
       }
       hist = await syncMerge(acc, hist);
       saveLocalHist(player.name, hist);
       if (pending.length) store.set('migrated', migrated.concat(pending.map((old) => old + '>' + acc)));
-      syncNote = '历史记录已同步（' + acc + '）' + playNote;
+      syncNote = '历史记录已同步（chunithm/' + acc + '）' + note;
     } catch (e) {
-      syncNote = '同步失败：' + e.message + '。已保存在本机，下次运行会重试' + playNote;
+      syncNote = '同步失败：' + e.message + '。已保存在本机，下次运行会重试' + note;
     }
     return hist;
   }
@@ -711,7 +818,7 @@
     f.appendChild(back);
   }
 
-  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating };
+  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating };
 
   // ---------- 历史走势 ----------
   async function runHistory() {
@@ -723,7 +830,7 @@
   }
 
   function showHistoryPanel(hist, player, db) {
-    const { pb, log } = derive(hist);
+    const { pb, updates } = derive(hist);
     box.innerHTML = '';
     const p = document.createElement('div');
     p.style.cssText = 'margin:4vh auto 0;max-width:520px;text-align:left;';
@@ -733,22 +840,61 @@
       '<div style="font-size:20px;font-weight:bold;margin-bottom:6px;">历史走势</div>' +
       '<div style="font-size:14px;color:#ffffffcc;">' + esc(syncNote) + '</div>' +
       '<div style="font-size:14px;color:#ffffffcc;margin:6px 0 12px;">' +
-      hist.snaps.length + ' 个 Rating 快照' + (first ? '（' + first.t.slice(0, 10) + ' 起）' : '') + '　·　' +
-      hist.obs.filter((o) => o.src === 'p').length + ' 条游玩记录　·　' + log.length + ' 次个人最佳更新' +
+      (hist.since ? '从 ' + esc(hist.since) + ' 开始记录　·　' : '') +
+      hist.snaps.length + ' 个 Rating 快照　·　' +
+      hist.obs.filter((o) => o.src === 'p').length + ' 条游玩记录　·　' + updates.length + ' 次推分' +
       (last ? '<br>当前 Rating ' + last.r.toFixed(2) + (first && first !== last ? '（' + signed(last.r - first.r) + '）' : '') : '') + '</div>';
     box.appendChild(p);
 
-    const b1 = document.createElement('button');
-    b1.textContent = '生成走势图';
-    b1.style.cssText = btnCss + 'background:#c9a2ff;color:#222;margin:4px 8px 12px 0;';
-    b1.onclick = () => run(() => showResult([() => drawTrend(hist, player, db)], 'chunithm-history'));
-    const back = document.createElement('button');
-    back.textContent = '返回菜单';
-    back.style.cssText = btnCss + 'background:#ffffff22;color:#fff;margin:4px 0 12px;padding:12px 20px;';
-    back.onclick = showMenu;
-    p.append(b1, back);
+    const mk = (label, css, fn) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = btnCss + css;
+      b.onclick = fn;
+      p.appendChild(b);
+      return b;
+    };
+    mk('生成走势图', 'background:#c9a2ff;color:#222;margin:4px 8px 8px 0;', () => run(() => showResult([() => drawTrend(hist, player, db)], 'chunithm-history')));
+    mk('返回菜单', 'background:#ffffff22;color:#fff;margin:4px 0 8px;padding:12px 20px;', showMenu);
+    p.appendChild(document.createElement('br'));
+    const small = 'background:#ffffff22;color:#fff;margin:0 8px 12px 0;padding:8px 16px;font-size:14px;';
+    if (SYNC_URL) {
+      mk('更改同步名字', small, () => run(async () => {
+        const h = await recordAndSync(lastRun, { forceAsk: true });
+        showHistoryPanel(h, player, db);
+      }));
+    }
+    // 清空历史（本机和云端），把现在的成绩和 Rating 当作新的起点
+    mk('从现在重新开始记录', small, () => {
+      if (!confirm('清空这个账号的全部历史记录' + (SYNC_URL ? '（本机和云端）' : '') +
+        '，把现在全部谱面的成绩当作新的起点，从现在开始重新记录？\n清空后无法恢复。')) return;
+      run(async () => {
+        const h = await recordAndSync(lastRun, { reset: true });
+        showHistoryPanel(h, player, db);
+      });
+    });
+    // 调试信息：プレイ履歴第一条的原始 HTML 等。复制后发给开发者
+    mk('调试信息', small, async () => {
+      const info = JSON.stringify({
+        ua: navigator.userAgent,
+        scanned: lastRun && lastRun.all ? lastRun.all.length : null,
+        lamps: lastRun && lastRun.all ? lastRun.all.filter((s) => s.lamp).length : null,
+        playlogSample,
+        history: { since: hist.since, snaps: hist.snaps.length, obs: hist.obs.length, plays: hist.obs.filter((o) => o.src === 'p').length, updates: updates.length, syncNote },
+      }, null, 1);
+      let ta = p.querySelector('textarea');
+      if (!ta) {
+        ta = document.createElement('textarea');
+        ta.readOnly = true;
+        ta.style.cssText = 'display:block;width:100%;height:180px;box-sizing:border-box;margin:0 0 12px;font:11px monospace;background:#0d1020;color:#ddd;border:1px solid #fff3;border-radius:8px;';
+        sec.before(ta);
+      }
+      ta.value = info;
+      try { await navigator.clipboard.writeText(info); alert('调试信息已复制，粘贴发给开发者即可。'); } catch (e) { ta.focus(); ta.select(); }
+    });
 
-    // 单曲曲线：搜索有记录的曲目
+    // 单曲曲线：只列出プレイ履歴里出现过、或有推分记录的谱面
+    const pushed = new Set(updates.map((u) => u.k));
     const songs = new Map();
     hist.obs.forEach((o) => {
       if (o.d < 2) return;
@@ -766,13 +912,16 @@
     p.appendChild(sec);
     const listEl = sec.querySelector('#b50-songs');
     const render = () => {
-      const q = sec.querySelector('#b50-q').value.trim().toLowerCase();
+      const q = normTitle(sec.querySelector('#b50-q').value).toLowerCase();
       const items = [...songs.values()]
-        .filter((e) => !q || e.n.toLowerCase().includes(q))
+        .filter((e) => (e.plays > 0 || pushed.has(e.k)) && (!q || normTitle(e.n).toLowerCase().includes(q)))
         .sort((a, b) => b.plays - a.plays || (a.last < b.last ? 1 : -1))
         .slice(0, 30);
       listEl.innerHTML = '';
-      if (!items.length) { listEl.innerHTML = '<div style="color:#ffffff88;font-size:14px;">没有记录</div>'; return; }
+      if (!items.length) {
+        listEl.innerHTML = '<div style="color:#ffffff88;font-size:14px;">没有记录（プレイ履歴里出现过、或有推分记录的谱面才会列在这里）</div>';
+        return;
+      }
       items.forEach((e) => {
         const row = document.createElement('button');
         row.style.cssText = '-webkit-appearance:none;display:flex;width:100%;align-items:center;gap:8px;text-align:left;margin:4px 0;padding:8px 10px;' +
@@ -781,10 +930,10 @@
           DIFFS[e.d].short + '</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(e.n) +
           '</span><span style="color:#ffffff99;font-size:12px;">' + (pb[e.k] || 0).toLocaleString('en-US') + '　' + e.plays + ' 次</span>';
         row.onclick = () => run(async () => {
-          const idx = e.k.split(':')[0];
+          const idx = e.k.startsWith('n:') ? 'n' : e.k.split(':')[0];
           const s = enrich({ idx, diff: e.d, title: e.n, score: pb[e.k] || 0 }, db);
           if (s.jacket) await loadJackets([s]);
-          await showResult([() => drawSongCurve(hist, e, s, player)], 'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40));
+          await showResult([() => drawSongCurve(hist, e, s, player, db)], 'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40));
         });
         listEl.appendChild(row);
       });
@@ -993,51 +1142,54 @@
     return bw;
   }
 
-  // 某首歌（观测记录的 k / 曲名 / 难度）的定数，查不到时返回 0
+  // 某首歌（观测记录的 k / 曲名 / 难度）的定数，查不到时 c = 0
   const constOf = (k, n, d, db) => {
-    const s = enrich({ idx: k.split(':')[0], diff: d, title: n, score: 0 }, db);
+    const s = enrich({ idx: k.startsWith('n:') ? 'n' : k.split(':')[0], diff: d, title: n, score: 0 }, db);
     return { c: s.constant || 0, est: !!s.estimated };
   };
+  const diffOfKey = (k) => Number(k.slice(k.lastIndexOf(':') + 1));
+  // 单曲 Rating（0.01 单位，截断）
+  const centsOf = (score, c) => (c ? Math.floor(songRating(score, c) * 100 + 1e-6) : 0);
 
-  // 单曲 Rating 的变化，画在 (x, y) 处右对齐：「Rating 15.42 → 15.67  +0.25」
+  // 单曲 Rating 的变化，画在 (x, y) 处右对齐：「Rating 15.42 → 15.67  +0.25」；返回占用的宽度
   function ratingChange(g, x, y, from, to, cInfo, size) {
-    g.textAlign = 'right';
-    g.font = (size || 14) + 'px ' + FONT;
-    if (!cInfo.c) { g.fillStyle = '#ffffff66'; g.fillText('定数未知', x, y); g.textAlign = 'left'; return; }
-    const r1 = songRating(to, cInfo.c);
-    const r0 = from != null ? songRating(from, cInfo.c) : null;
-    // 用显示出来的两个数（各自截到 0.01）相减，保证差值和左边的数字对得上
-    const cents = (r) => Math.floor(r * 100 + 1e-6);
-    const diff = r0 != null ? cents(r1) - cents(r0) : null;
+    const px = size || 14;
     let cx = x;
-    if (diff != null) {
-      g.fillStyle = diff > 0 ? '#7ee0a0' : '#ffffff66'; g.font = 'bold ' + (size || 14) + 'px ' + FONT;
-      const t = diff > 0 ? '+' + (diff / 100).toFixed(2) : '±0.00';
-      g.fillText(t, cx, y);
-      cx -= g.measureText(t).width + 10;
-    }
-    g.fillStyle = '#ffd65a'; g.font = 'bold ' + (size || 14) + 'px ' + FONT;
-    const now = floor2(r1) + (cInfo.est ? '*' : '');
-    g.fillText(now, cx, y);
-    cx -= g.measureText(now).width + 6;
-    g.fillStyle = '#ffffff99'; g.font = (size || 14) + 'px ' + FONT;
-    g.fillText('Rating ' + (r0 != null ? floor2(r0) + ' →' : '→'), cx, y);
-    g.textAlign = 'left';
+    const seg = (text, color, bold) => {
+      g.font = (bold ? 'bold ' : '') + px + 'px ' + FONT;
+      g.fillStyle = color;
+      const w = g.measureText(text).width;
+      g.fillText(text, cx - w, y);
+      cx -= w + 8;
+    };
+    if (!cInfo.c) { seg('定数未知', '#ffffff66'); return x - cx; }
+    const r1 = centsOf(to, cInfo.c);
+    const r0 = from != null ? centsOf(from, cInfo.c) : null;
+    // 用显示出来的两个数（各自截到 0.01）相减，保证差值和左边的数字对得上
+    if (r0 != null) seg(r1 > r0 ? '+' + ((r1 - r0) / 100).toFixed(2) : '±0.00', r1 > r0 ? '#7ee0a0' : '#ffffff66', true);
+    seg((r1 / 100).toFixed(2) + (cInfo.est ? '*' : ''), '#ffd65a', true);
+    seg('Rating ' + (r0 != null ? (r0 / 100).toFixed(2) + ' →' : '→'), '#ffffff99');
+    return x - cx;
   }
 
-  // 推算每次个人最佳更新对账号 Rating 的影响。
-  // 以推分之前最近的快照（当时完整的 BEST 30 / NEW 20）为起点，按时间顺序依次放入每次刷新的分数，
-  // 比较前后的账号 Rating（B50 单曲 Rating 之和 / 50）。经过新的快照时以快照为准重新开始，避免误差累积。
-  function accountImpact(hist, log, db) {
+  // 推分内容的文字：「1,003,000 → 1,005,000（+2,000）· FC→AJ」
+  function changeText(u) {
+    return u.changes.map((c) => (c.type === 'score'
+      ? (c.from != null ? c.from.toLocaleString('en-US') + ' → ' + c.to.toLocaleString('en-US') + '（+' + (c.to - c.from).toLocaleString('en-US') + '）'
+        : c.to.toLocaleString('en-US') + '（首次）')
+      : c.from === null ? c.to : (c.from || 'CLEAR') + '→' + c.to)).join(' · ');
+  }
+
+  // 推算每次推分对账号 Rating 的影响（与 ongeki-score-export / maimai-dx-score 相同的做法）。
+  // 以推分之前最近的快照（当时完整的 BEST 30 / NEW 20）为起点，按时间顺序依次放入每次推分后的单曲 Rating，
+  // 超出枠的数量时挤掉最低的一首；账号 Rating = 50 首单曲 Rating 之和 ÷ 50 截断到 0.01。经过新的快照时以快照为准重新开始。
+  // CHUNITHM 的 Rating 和 FC/AJ 无关：只有标记提升的推分，单曲和账号 Rating 都不变
+  function accountImpact(hist, updates, db) {
     const snaps = hist.snaps;
-    const diffOf = (k) => Number(k.slice(k.lastIndexOf(':') + 1));
     const cache = new Map();
     const cents = (k, n, s) => {
       const id = k + '|' + s;
-      if (!cache.has(id)) {
-        const c = constOf(k, n, diffOf(k), db).c;
-        cache.set(id, c ? Math.floor(songRating(s, c) * 100 + 1e-6) : 0);
-      }
+      if (!cache.has(id)) cache.set(id, centsOf(s, constOf(k, n, diffOfKey(k), db).c));
       return cache.get(id);
     };
     // 属于 NEW 还是 BEST：先看出现在哪个框的快照里，都没出现过就看版本是否和 NEW 20 的主流版本相同
@@ -1048,192 +1200,240 @@
     if (latest) latest.news.forEach((e) => { const m = db.byId.get(e[0].split(':')[0]); if (m && m.version) verCount[m.version] = (verCount[m.version] || 0) + 1; });
     const newVer = Object.keys(verCount).sort((a, b) => verCount[b] - verCount[a])[0];
     const isNew = (k) => (inNew.has(k) ? true : inBest.has(k) ? false : !!(newVer && (db.byId.get(k.split(':')[0]) || {}).version === newVer));
-
+    // 快照里存了单曲 Rating（e[3]）就直接用，旧版本的快照按分数和现在的定数计算
     const fromSnap = (s) => ({
-      best: new Map(s.best.map((e) => [e[0], { n: e[1], s: e[2] }])),
-      news: new Map(s.news.map((e) => [e[0], { n: e[1], s: e[2] }])),
+      best: new Map(s.best.map((e) => [e[0], e[3] != null ? e[3] : cents(e[0], e[1], e[2])])),
+      news: new Map(s.news.map((e) => [e[0], e[3] != null ? e[3] : cents(e[0], e[1], e[2])])),
     });
-    // 返回 B50 单曲 Rating 之和（单位 0.01）
-    const sum = (st) => [...st.best, ...st.news].reduce((a, [k, v]) => a + cents(k, v.n, v.s), 0);
+    const sum = (st) => [...st.best.values(), ...st.news.values()].reduce((a, v) => a + v, 0);
+    // 放入一个值；超出 cap 时挤掉最低的一首（可能就是它自己）
+    const put = (m, k, v, cap) => {
+      const was = m.has(k);
+      if (!was || v > m.get(k)) m.set(k, v);
+      if (m.size > cap) {
+        let low = null, lowV = Infinity;
+        m.forEach((x, kk) => { if (x < lowV || (x === lowV && kk === k)) { low = kk; lowV = x; } });
+        m.delete(low);
+      }
+      return { entered: !was && m.has(k), inFrame: m.has(k) };
+    };
     const out = new Map();
     let si = -1, st = null;
-    log.slice().sort(byTime).forEach((o) => {
-      while (si + 1 < snaps.length && snaps[si + 1].t < o.t) { si++; st = fromSnap(snaps[si]); }
-      if (!st) { out.set(o, null); return; }
+    updates.slice().sort(byTime).forEach((u) => {
+      // 没有曲目列表的快照（数据不全）不能当起点
+      while (si + 1 < snaps.length && snaps[si + 1].t < u.t) { si++; st = snaps[si].best.length || snaps[si].news.length ? fromSnap(snaps[si]) : null; }
+      if (!st) { out.set(u, { noSnap: true }); return; }
+      if (!constOf(u.k, u.n, u.d, db).c) { out.set(u, { noConst: true }); return; }
+      if (!u.changes.some((c) => c.type === 'score')) { out.set(u, { lampOnly: true }); return; }
       const before = sum(st);
-      const frame = st.best.has(o.k) ? 'best' : st.news.has(o.k) ? 'news' : (isNew(o.k) ? 'news' : 'best');
-      const list = st[frame], cap = frame === 'best' ? 30 : 20;
-      const wasIn = list.has(o.k);
-      if (!wasIn || o.s > list.get(o.k).s) list.set(o.k, { n: o.n, s: o.s });
-      if (list.size > cap) {
-        // 挤掉框里单曲 Rating 最低的一首（可能就是这首）
-        let low = null, lowC = Infinity;
-        list.forEach((v, k) => { const c = cents(k, v.n, v.s); if (c < lowC || (c === lowC && k === o.k)) { low = k; lowC = c; } });
-        list.delete(low);
-      }
+      const frame = st.best.has(u.k) ? 'best' : st.news.has(u.k) ? 'news' : (isNew(u.k) ? 'news' : 'best');
+      const res = { frame: frame === 'best' ? 'BEST 30' : 'NEW 20' };
+      Object.assign(res, put(st[frame], u.k, cents(u.k, u.n, u.after.s), frame === 'best' ? 30 : 20));
       const after = sum(st);
-      out.set(o, {
-        frame, entered: !wasIn && list.has(o.k), inB50: list.has(o.k),
-        delta: Math.floor(after / 50) - Math.floor(before / 50), // 账号 Rating 显示值的变化（单位 0.01）
-        exact: (after - before) / 50 / 100,
-      });
+      res.delta = Math.floor(after / 50) - Math.floor(before / 50); // 账号 Rating 显示值的变化（0.01 单位）
+      res.exact = (after - before) / 50 / 100;
+      out.set(u, res);
     });
     return out;
   }
 
-  // 「进入 BEST 30 · 账号 Rating +0.02」之类的说明文字和颜色
+  // 「进入 BEST 30 · 账号 Rating +0.02（推算）」之类的说明文字和颜色
+  const GOOD = '#7ee0a0';
   const impactText = (im) => {
-    if (!im) return ['之前没有快照，无法推算账号 Rating', '#ffffff55'];
-    const frame = im.frame === 'best' ? 'BEST 30' : 'NEW 20';
-    if (!im.inB50) return ['未进入 ' + frame + '，账号 Rating 不变', '#ffffff66'];
-    const head = im.entered ? '进入 ' + frame + ' · ' : '';
-    if (im.delta > 0) return [head + '账号 Rating +' + (im.delta / 100).toFixed(2), '#7ee0a0'];
-    return [head + '账号 Rating 不变（+' + im.exact.toFixed(4) + '，未进位）', '#ffffff99'];
+    if (!im || im.noSnap) return ['之前没有快照，无法推算账号 Rating', '#ffffff55'];
+    if (im.noConst) return ['定数未知，无法推算账号 Rating', '#ffffff66'];
+    if (im.lampOnly) return ['只有标记提升 · 单曲 Rating 和账号 Rating 不变', '#ffffff66'];
+    const head = im.entered ? '进入 ' + im.frame : im.inFrame ? im.frame + ' 内提升' : '未进入 ' + im.frame;
+    if (im.delta > 0) return [head + ' · 账号 Rating +' + (im.delta / 100).toFixed(2) + '（推算）', GOOD];
+    if (im.exact > 0) return [head + ' · 账号 Rating 不变（+' + im.exact.toFixed(4) + '，未进位，推算）', '#ffffff99'];
+    return [head + ' · 账号 Rating 不变（推算）', '#ffffff66'];
   };
 
+  const LAMP_COLOR = { FC: '#7ee0ff', AJ: '#ffb86b', AJC: '#ffd65a' };
+  // 小标签（FC / AJ / AJC），返回宽度
+  function pill(g, text, x, y, color) {
+    g.font = 'bold 12px ' + FONT;
+    const w = g.measureText(text).width + 12;
+    round(g, x, y - 14, w, 18, 4);
+    g.fillStyle = color; g.fill();
+    g.fillStyle = '#16151c'; g.fillText(text, x + 6, y);
+    return w;
+  }
+
   function drawTrend(hist, player, db) {
-    const { log } = derive(hist);
-    const impact = accountImpact(hist, log, db);
+    const { updates } = derive(hist);
+    const impact = accountImpact(hist, updates, db);
     const snaps = hist.snaps;
     const last = snaps[snaps.length - 1], prev = snaps[snaps.length - 2];
-    // B50 变化
-    const changes = { inn: [], out: [], up: [] };
+    const rowCents = (e) => (e[3] != null ? e[3] : centsOf(e[2], constOf(e[0], e[1], diffOfKey(e[0]), db).c));
+
+    // 和上一次快照相比：B50 的进出与提升（分数、标记都算）
+    const rows = []; // {side:'L'|'R', e, color, right, sub}
+    let upMore = 0;
     if (last && prev) {
       const toMap = (s) => new Map([...s.best, ...s.news].map((e) => [e[0], e]));
       const a = toMap(prev), b = toMap(last);
-      b.forEach((e, k) => { if (!a.has(k)) changes.inn.push(e); else if (e[2] > a.get(k)[2]) changes.up.push([...e, a.get(k)[2]]); });
-      a.forEach((e, k) => { if (!b.has(k)) changes.out.push(e); });
-      // 提升的曲目只列出幅度最大的 10 首，其余汇总成一行
-      changes.up.sort((p, q) => (q[2] - q[3]) - (p[2] - p[3]));
-      changes.upMore = Math.max(0, changes.up.length - 10);
-      changes.up = changes.up.slice(0, 10);
+      const ups = [];
+      b.forEach((e, k) => {
+        const o = a.get(k);
+        if (!o) { rows.push({ side: 'L', e, color: GOOD, right: '新进 ' + (rowCents(e) / 100).toFixed(2) }); return; }
+        const why = [];
+        if (e[2] > o[2]) why.push('+' + (e[2] - o[2]).toLocaleString('en-US'));
+        if (e[4] != null && o[4] != null && LAMP_RANK[e[4]] > LAMP_RANK[o[4]]) why.push((o[4] || 'CLEAR') + '→' + e[4]);
+        const dr = rowCents(e) - rowCents(o);
+        if (why.length || dr > 0) ups.push({ e, dr, why });
+      });
+      ups.sort((p, q) => q.dr - p.dr);
+      upMore = Math.max(0, ups.length - 10);
+      // 分数 / 标记提升了但单曲 Rating 没变的，用灰色写「rating 不变」
+      ups.slice(0, 10).forEach(({ e, dr, why }) => rows.push({
+        side: 'L', e, color: dr > 0 ? '#ffd65a' : '#ffffff77',
+        right: dr > 0 ? ((rowCents(e) - dr) / 100).toFixed(2) + ' → ' + (rowCents(e) / 100).toFixed(2) + '（+' + (dr / 100).toFixed(2) + '）'
+          : (rowCents(e) / 100).toFixed(2) + '（rating 不变）',
+        sub: why.join(' · '),
+      }));
+      a.forEach((e, k) => { if (!b.has(k)) rows.push({ side: 'R', e, color: '#ff8a8a', right: '移出 ' + (rowCents(e) / 100).toFixed(2) }); });
     }
-    const recent = log.slice(-20).reverse();
-    const ROW = 34, PB_ROW = 54;
-    const changeRows = Math.max(changes.inn.length + changes.up.length + (changes.upMore ? 1 : 0), changes.out.length, 1);
-    const H = 170 + 460 + 70 + changeRows * ROW + 70 + Math.max(recent.length, 1) * PB_ROW + 60;
+    const recent = updates.slice(-20).reverse();
+    const ROW = 34, SUBROW = 20, PB_ROW = 58;
+    const colRows = (side) => rows.filter((r) => r.side === side).reduce((a, r) => a + ROW + (r.sub ? SUBROW : 0), 0);
+    const changeH = Math.max(colRows('L') + (upMore ? ROW : 0), colRows('R'), ROW);
+    const H = 170 + 440 + 20 + 86 + changeH + 30 + 64 + Math.max(recent.length, 1) * PB_ROW + 60;
     const { cv, g } = newCanvas(H, HW);
 
-    // 头部
+    // 头部。Rating 按天连线：每天取当天最后一次查询的值，点放在当天中午
     g.fillStyle = '#ffffff99'; g.font = '600 20px ' + FONT;
     g.fillText('CHUNITHM  RATING  HISTORY', PAD, PAD + 22);
     g.fillStyle = '#fff'; g.font = 'bold 44px ' + FONT;
     g.fillText(fit(g, player.name || hist.name, 560), PAD, PAD + 78);
+    const daily = (f) => {
+      const days = new Map();
+      snaps.filter((s) => f(s)).forEach((s) => {
+        const d = new Date(timeMs(s.t));
+        days.set(new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12).getTime(), f(s));
+      });
+      return [...days.entries()].sort((x, y) => x[0] - y[0]);
+    };
+    const line = daily((s) => s.r);
     const rx = HW - PAD;
-    const msAgo = (days) => Date.now() - days * 864e5;
-    const at = (ms) => [...snaps].reverse().find((s) => timeMs(s.t) <= ms) || snaps[0];
-    if (last) {
-      stat(g, 'RATING', last.r.toFixed(2), rx, '#ffd65a', true);
-      const d30 = at(msAgo(30));
-      stat(g, '30 天', d30 ? signed(last.r - d30.r) : '-', rx - 230, '#7ee0ff');
-      stat(g, '累计', signed(last.r - snaps[0].r), rx - 400, '#c9a2ff');
+    if (line.length) {
+      const now = line[line.length - 1][1];
+      const base30 = [...line].reverse().find((pt) => pt[0] <= Date.now() - 30 * 864e5) || line[0];
+      stat(g, 'RATING', now.toFixed(2), rx, '#ffd65a', true);
+      stat(g, '30 天', signed(now - base30[1]), rx - 230, '#7ee0ff');
+      stat(g, '累计', signed(now - line[0][1]), rx - 400, '#c9a2ff');
     }
     g.fillStyle = '#ffffff80'; g.font = '14px ' + FONT; g.textAlign = 'right';
-    g.fillText(snaps.length + ' 个快照' + (snaps[0] ? '（' + snaps[0].t.slice(0, 10) + ' – ' + last.t.slice(0, 10) + '）' : ''), rx, PAD + 122);
+    g.fillText(line.length ? line.length + ' 天的记录（' + new Date(line[0][0]).toLocaleDateString('ja-JP') + ' – ' +
+      new Date(line[line.length - 1][0]).toLocaleDateString('ja-JP') + '）' + (hist.since ? '　·　从 ' + hist.since + ' 开始记录' : '') : '', rx, PAD + 122);
     g.textAlign = 'left';
     g.fillStyle = '#ffffff33'; g.fillRect(PAD, 148, HW - PAD * 2, 2);
 
     let y = 170;
-    if (snaps.length) {
-      const pts = (f) => snaps.map((s) => [timeMs(s.t), f(s)]);
+    if (line.length) {
       lineChart(g, PAD, y, HW - PAD * 2, 440, [
-        { label: 'RATING', color: '#ffd65a', pts: pts((s) => s.r), width: 4 },
-        { label: 'BEST 30 平均', color: '#c9a2ff', pts: pts((s) => s.b30), width: 2, dot: 3 },
-        { label: 'NEW 20 平均', color: '#7ee0ff', pts: pts((s) => s.n20), width: 2, dot: 3 },
+        { label: 'RATING（每天）', color: '#ffd65a', pts: line, width: 4 },
+        { label: 'BEST 30 平均', color: '#c9a2ff', pts: daily((s) => s.b30), width: 2, dot: 3 },
+        { label: 'NEW 20 平均', color: '#7ee0ff', pts: daily((s) => s.n20), width: 2, dot: 3 },
       ], { minSpan: 0.2, fmt: (v) => v.toFixed(2) });
-      if (snaps.length === 1) {
+      if (line.length === 1) {
         g.fillStyle = '#ffffffaa'; g.font = '16px ' + FONT; g.textAlign = 'center';
-        g.fillText('目前只有 1 个快照，多运行几次后就能看到曲线', HW / 2, y + 60); g.textAlign = 'left';
+        g.fillText('目前只有 1 天的记录，以后每天运行一次就能连成线', HW / 2, y + 60); g.textAlign = 'left';
       }
     }
     y += 460;
 
-    // B50 变化
+    // B50 变化：标题行右边写两次快照之间账号 Rating 的实际变化，以及 BEST 30 / NEW 20 各自对账号 Rating 的贡献变化
     sectionTitle(g, 'B50 变化' + (prev ? '（对比 ' + prev.t + '）' : ''), y, '#c9a2ff');
     if (prev) {
-      // 两次快照之间实际的账号 Rating 变化（来自 CHUNITHM-NET 的显示值）
       const dr = Math.round((last.r - prev.r) * 100);
       g.textAlign = 'right'; g.font = 'bold 18px ' + FONT;
-      g.fillStyle = dr > 0 ? '#7ee0a0' : dr < 0 ? '#ff8a8a' : '#ffffff88';
-      g.fillText('账号 Rating ' + prev.r.toFixed(2) + ' → ' + last.r.toFixed(2) + '　' + (dr > 0 ? '+' : dr < 0 ? '−' : '±') + (Math.abs(dr) / 100).toFixed(2), HW - PAD, y + 34);
+      g.fillStyle = dr > 0 ? GOOD : dr < 0 ? '#ff8a8a' : '#ffffff88';
+      g.fillText('账号 Rating ' + prev.r.toFixed(2) + ' → ' + last.r.toFixed(2) + '　' + (dr > 0 ? '+' : dr < 0 ? '−' : '±') + (Math.abs(dr) / 100).toFixed(2), rx, y + 32);
+      const part = (s, f) => s[f].reduce((a, e) => a + rowCents(e), 0) / 50 / 100;
+      const fmt = (d) => (d > 0.00005 ? '+' : d < -0.00005 ? '−' : '±') + Math.abs(d).toFixed(4);
+      g.font = '14px ' + FONT; g.fillStyle = '#ffffff88';
+      g.fillText('BEST 30 ' + fmt(part(last, 'best') - part(prev, 'best')) + '　·　NEW 20 ' + fmt(part(last, 'news') - part(prev, 'news')) + '（对账号 Rating 的贡献）', rx, y + 56);
       g.textAlign = 'left';
     }
-    y += 64;
+    y += 86;
     const colW = (HW - PAD * 2 - 24) / 2;
-    const rowText = (x, yy, e, color, right) => {
-      const d = Number(e[0].split(':')[1]);
-      const bw = diffBadge(g, d, x, yy);
+    const rowText = (x, yy, r) => {
+      const bw = diffBadge(g, diffOfKey(r.e[0]), x, yy);
+      g.font = 'bold 15px ' + FONT;
+      const rw = g.measureText(r.right).width;
       g.fillStyle = '#fff'; g.font = '16px ' + FONT;
-      g.fillText(fit(g, e[1], colW - bw - 170), x + bw + 8, yy);
-      g.textAlign = 'right'; g.fillStyle = color; g.font = 'bold 16px ' + FONT;
-      g.fillText(right, x + colW - 6, yy); g.textAlign = 'left';
+      g.fillText(fit(g, r.e[1], colW - bw - rw - 24), x + bw + 8, yy);
+      g.textAlign = 'right'; g.fillStyle = r.color; g.font = 'bold 15px ' + FONT;
+      g.fillText(r.right, x + colW - 6, yy);
+      if (r.sub) { g.fillStyle = '#ffffff88'; g.font = '13px ' + FONT; g.fillText(r.sub, x + colW - 6, yy + SUBROW); }
+      g.textAlign = 'left';
+      return ROW + (r.sub ? SUBROW : 0);
     };
     g.font = 'bold 15px ' + FONT;
     if (!prev) {
       g.fillStyle = '#ffffff88'; g.fillText('还没有上一次的快照可以对比', PAD, y);
-    } else if (!changes.inn.length && !changes.out.length && !changes.up.length) {
+    } else if (!rows.length) {
       g.fillStyle = '#ffffff88'; g.fillText('和上次相比没有变化', PAD, y);
     } else {
       let yy = y;
-      changes.inn.forEach((e) => { rowText(PAD, yy, e, '#7ee0a0', '新进 ' + e[2].toLocaleString('en-US')); yy += ROW; });
-      changes.up.forEach((e) => { rowText(PAD, yy, e, '#ffd65a', '+' + (e[2] - e[3]).toLocaleString('en-US') + ' → ' + e[2].toLocaleString('en-US')); yy += ROW; });
-      if (changes.upMore) {
-        g.fillStyle = '#ffffff88'; g.font = '15px ' + FONT;
-        g.fillText('另有 ' + changes.upMore + ' 首分数提升', PAD, yy); yy += ROW;
-      }
+      rows.filter((r) => r.side === 'L').forEach((r) => { yy += rowText(PAD, yy, r); });
+      if (upMore) { g.fillStyle = '#ffffff88'; g.font = '15px ' + FONT; g.fillText('另有 ' + upMore + ' 首提升', PAD, yy); }
       yy = y;
-      changes.out.forEach((e) => { rowText(PAD + colW + 24, yy, e, '#ff8a8a', '移出 ' + e[2].toLocaleString('en-US')); yy += ROW; });
+      rows.filter((r) => r.side === 'R').forEach((r) => { yy += rowText(PAD + colW + 24, yy, r); });
     }
-    y += changeRows * ROW;
+    y += changeH;
 
-    // 个人最佳更新
+    // 推分记录：每条两行。上行 时间 / 难度 / 曲名 / 推分内容；下行 对账号 Rating 的影响 / 单曲 Rating 的变化
     y += 6;
-    sectionTitle(g, '最近的个人最佳更新', y, '#ffd65a');
+    sectionTitle(g, '最近的推分', y, '#ffd65a');
     y += 64;
     if (!recent.length) {
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
-      g.fillText('暂无记录。プレイ履歴里出现刷新记录、或成绩扫描发现更高分时会记在这里', PAD, y);
+      g.fillText('暂无记录。分数、FC/AJ 标记有提升时会记在这里', PAD, y);
     }
-    // 每条两行：上行 日期 / 难度 / 曲名 / 分数变化；下行 单曲 Rating 变化
-    recent.forEach((o) => {
+    recent.forEach((u) => {
       g.fillStyle = '#ffffff88'; g.font = '14px ' + FONT;
-      g.fillText(o.t + (o.src === 'b' ? '*' : ''), PAD, y);
-      const bw = diffBadge(g, o.d, PAD + 150, y);
+      g.fillText(u.t + (u.src === 'b' ? '*' : ''), PAD, y);
+      const bw = diffBadge(g, u.d, PAD + 150, y);
+      const what = changeText(u);
+      g.font = 'bold 15px ' + FONT;
+      const ww = Math.min(g.measureText(what).width, 520);
       g.fillStyle = '#fff'; g.font = '16px ' + FONT;
-      g.fillText(fit(g, o.n, HW - PAD * 2 - 150 - bw - 330), PAD + 150 + bw + 8, y);
-      g.textAlign = 'right';
-      g.fillStyle = '#ffffff99'; g.font = '15px ' + FONT;
-      g.fillText(o.f != null ? o.f.toLocaleString('en-US') + ' →' : 'NEW RECORD', HW - PAD - 200, y);
-      g.fillStyle = '#ffd65a'; g.font = 'bold 17px ' + FONT;
-      g.fillText(o.s.toLocaleString('en-US') + '  ' + scoreRank(o.s), HW - PAD - 60, y);
-      g.fillStyle = '#7ee0a0'; g.font = 'bold 14px ' + FONT;
-      g.fillText(o.f != null ? '+' + (o.s - o.f).toLocaleString('en-US') : '', HW - PAD, y);
+      g.fillText(fit(g, u.n, HW - PAD * 2 - 150 - bw - ww - 30), PAD + 150 + bw + 8, y);
+      g.textAlign = 'right'; g.fillStyle = '#ffd65a'; g.font = 'bold 15px ' + FONT;
+      g.fillText(fit(g, what, 520), rx, y);
       g.textAlign = 'left';
-      ratingChange(g, HW - PAD, y + 22, o.f, o.s, constOf(o.k, o.n, o.d, db), 14);
-      const [itext, icolor] = impactText(impact.get(o));
-      g.fillStyle = icolor; g.font = (icolor === '#7ee0a0' ? 'bold ' : '') + '14px ' + FONT;
-      g.fillText(fit(g, itext, HW - PAD * 2 - 150 - 330), PAD + 150, y + 22);
-      g.fillStyle = 'rgba(255,255,255,0.06)'; g.fillRect(PAD, y + 34, HW - PAD * 2, 1);
+      const rw = ratingChange(g, rx, y + 24, u.before ? u.before.s : null, u.after.s, constOf(u.k, u.n, u.d, db), 14);
+      const [itext, icolor] = impactText(impact.get(u));
+      g.fillStyle = icolor; g.font = (icolor === GOOD ? 'bold ' : '') + '14px ' + FONT;
+      g.fillText(fit(g, itext, HW - PAD * 2 - 150 - rw - 20), PAD + 150, y + 24);
+      g.fillStyle = 'rgba(255,255,255,0.06)'; g.fillRect(PAD, y + 36, HW - PAD * 2, 1);
       y += PB_ROW;
     });
     const d = new Date();
     g.fillStyle = '#ffffff66'; g.font = '13px ' + FONT;
-    g.fillText('Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
-      '  ·  日期后的 * = 由成绩扫描发现（时间为运行书签的时间）  ·  Rating 后的 * = 定数未公开（推定）  ·  Rating 按当前定数计算', PAD, H - 20);
+    g.fillText(fit(g, 'Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
+      '  ·  时间后的 * = 由成绩扫描发现（时间为运行书签的时间）  ·  Rating 后的 * = 定数未公开（推定）  ·  单曲 Rating 按现在的定数计算', HW - PAD * 2), PAD, H - 20);
     return cv;
   }
 
-  function drawSongCurve(hist, e, s, player) {
+  function drawSongCurve(hist, e, s, player, db) {
     const obs = hist.obs.filter((o) => o.k === e.k).sort(byTime);
     const plays = obs.filter((o) => o.src === 'p');
+    const { state, updates } = derive(hist);
+    const impact = accountImpact(hist, updates, db);
+    const mine = updates.filter((u) => u.k === e.k).reverse().slice(0, 12);
+    const cur = state[e.k];
     // 个人最佳的阶梯线
     const pbPts = [];
     let best = -1;
     obs.forEach((o) => { if (o.s > best) { best = o.s; pbPts.push([timeMs(o.t), o.s]); } });
     const rows = plays.slice(-15).reverse();
-    const ROW = 32;
-    const H = 190 + 420 + 70 + Math.max(rows.length, 1) * ROW + 60;
+    const ROW = 32, UROW = 58;
+    const H = 190 + 420 + 20 + 64 + Math.max(mine.length, 1) * UROW + 20 + 64 + Math.max(rows.length, 1) * ROW + 50;
     const { cv, g } = newCanvas(H, HW);
+    const cInfo = { c: s.constant || 0, est: !!s.estimated };
 
     const J = 120;
     if (s.img) { g.save(); round(g, PAD, PAD, J, J, 10); g.clip(); g.drawImage(s.img, PAD, PAD, J, J); g.restore(); }
@@ -1242,34 +1442,69 @@
     g.fillText('CHUNITHM  SCORE HISTORY  ·  ' + (player.name || hist.name), tx, PAD + 20);
     g.fillStyle = '#fff'; g.font = 'bold 38px ' + FONT;
     g.fillText(fit(g, e.n, HW - tx - 300), tx, PAD + 68);
-    diffBadge(g, e.d, tx, PAD + 106, s.constant ? s.constant.toFixed(1) + (s.estimated ? '*' : '') : '');
+    let px = tx + diffBadge(g, e.d, tx, PAD + 106, s.constant ? s.constant.toFixed(1) + (s.estimated ? '*' : '') : '') + 8;
+    if (cur && cur.l) px += pill(g, cur.l, px, PAD + 106, LAMP_COLOR[cur.l]) + 6;
     const rx = HW - PAD;
     stat(g, 'BEST', best > 0 ? best.toLocaleString('en-US') : '-', rx, '#ffd65a', true);
     g.fillStyle = '#ffffff80'; g.font = '14px ' + FONT; g.textAlign = 'right';
-    g.fillText(scoreRank(best) + (s.constant ? '　·　单曲 Rating ' + floor2(songRating(best, s.constant)) : '') + '　·　记录到 ' + plays.length + ' 次游玩', rx, PAD + 122);
+    g.fillText([best > 0 ? scoreRank(best) : '', cInfo.c && best > 0 ? '单曲 Rating ' + (centsOf(best, cInfo.c) / 100).toFixed(2) : '',
+      '记录到 ' + plays.length + ' 次游玩'].filter(Boolean).join('　·　'), rx, PAD + 122);
     g.textAlign = 'left';
     g.fillStyle = '#ffffff33'; g.fillRect(PAD, 168, HW - PAD * 2, 2);
 
     let y = 190;
-    lineChart(g, PAD, y, HW - PAD * 2, 400, [
-      { label: '个人最佳', color: '#ffd65a', pts: pbPts, step: true, dots: false, width: 3 },
-      { label: '每次游玩', color: '#7ee0ff', pts: plays.map((o) => [timeMs(o.t), o.s]), line: false, dot: 5 },
-    ], {
-      minSpan: 4000, maxV: 1010000, fmt: (v) => Math.round(v).toLocaleString('en-US'),
-      refs: [{ v: 1009000, label: 'SSS+' }, { v: 1007500, label: 'SSS' }, { v: 1005000, label: 'SS+' }, { v: 1000000, label: 'SS' }, { v: 975000, label: 'S' }],
-    });
+    // 曲线图只画 AAA（950,000）以上的成绩，更低的不画（会把纵轴拉得很长），但推分记录、最近的游玩、游玩次数照常统计
+    const CHART_MIN = 950000;
+    const shownPlays = plays.filter((o) => o.s >= CHART_MIN);
+    const shownPb = pbPts.filter((pt) => pt[1] >= CHART_MIN);
+    if (!shownPlays.length && !shownPb.length) {
+      g.fillStyle = 'rgba(255,255,255,0.05)'; round(g, PAD, y, HW - PAD * 2, 400, 12); g.fill();
+      g.fillStyle = '#ffffff88'; g.font = '16px ' + FONT; g.textAlign = 'center';
+      g.fillText('还没有 AAA（950,000）以上的成绩，曲线图只画 AAA 以上的成绩', HW / 2, y + 200);
+      g.textAlign = 'left';
+    } else {
+      lineChart(g, PAD, y, HW - PAD * 2, 400, [
+        // 画出来的游玩不到 2 次时没有「变化」可画，不画个人最佳的线（否则会从成绩扫描的点连出一条线）
+        ...(shownPlays.length >= 2 ? [{ label: '个人最佳', color: '#ffd65a', pts: shownPb, step: true, dots: false, width: 3 }] : []),
+        { label: '每次游玩（AAA 以上）', color: '#7ee0ff', pts: shownPlays.map((o) => [timeMs(o.t), o.s]), line: false, dot: 5 },
+      ], {
+        minSpan: 4000, maxV: 1010000, fmt: (v) => Math.round(v).toLocaleString('en-US'),
+        refs: [{ v: 1009000, label: 'SSS+' }, { v: 1007500, label: 'SSS' }, { v: 1005000, label: 'SS+' }, { v: 1000000, label: 'SS' }, { v: 975000, label: 'S' }],
+      });
+    }
     y += 420;
+
+    // 这首歌的推分记录（分数、标记）
+    sectionTitle(g, '推分记录', y, '#ffd65a');
+    y += 64;
+    if (!mine.length) {
+      g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
+      g.fillText('还没有这首歌的推分记录', PAD, y);
+    }
+    mine.forEach((u) => {
+      g.fillStyle = '#ffffff99'; g.font = '15px ' + FONT;
+      g.fillText(u.t + (u.src === 'b' ? '*' : ''), PAD, y);
+      g.fillStyle = '#ffd65a'; g.font = 'bold 16px ' + FONT;
+      g.fillText(fit(g, changeText(u), HW - PAD * 2 - 180), PAD + 170, y);
+      const rw = ratingChange(g, rx, y + 24, u.before ? u.before.s : null, u.after.s, cInfo, 14);
+      const [itext, icolor] = impactText(impact.get(u));
+      g.fillStyle = icolor; g.font = (icolor === GOOD ? 'bold ' : '') + '14px ' + FONT;
+      g.fillText(fit(g, itext, HW - PAD * 2 - 170 - rw - 20), PAD + 170, y + 24);
+      g.fillStyle = 'rgba(255,255,255,0.06)'; g.fillRect(PAD, y + 36, HW - PAD * 2, 1);
+      y += UROW;
+    });
+    y += 20;
+
     sectionTitle(g, '最近的游玩', y, '#7ee0ff');
-    y += 62;
+    y += 64;
     if (!rows.length) {
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
-      g.fillText('还没有这首歌的游玩记录（只有成绩扫描的数据）', PAD, y);
+      g.fillText('还没有这首歌的プレイ履歴记录（只有成绩扫描的数据）', PAD, y);
     }
-    // 计算每次游玩时的历史最佳，用于显示“刷新了多少”
+    // 计算每次游玩时的历史最佳，用于显示「刷新了多少」
     const pbAt = new Map();
-    let run = -1;
-    obs.forEach((o) => { if (o.src === 'p') pbAt.set(o, run); if (o.s > run) run = o.s; });
-    const cInfo = { c: s.constant || 0, est: !!s.estimated };
+    let runBest = -1;
+    obs.forEach((o) => { if (o.src === 'p') pbAt.set(o, runBest); if (o.s > runBest) runBest = o.s; });
     rows.forEach((o) => {
       g.fillStyle = '#ffffff99'; g.font = '15px ' + FONT;
       g.fillText(o.t, PAD, y);
@@ -1277,23 +1512,28 @@
       g.fillText(o.s.toLocaleString('en-US'), PAD + 200, y);
       g.fillStyle = '#ffd65a'; g.font = 'bold 15px ' + FONT;
       g.fillText(scoreRank(o.s), PAD + 330, y);
+      // 这次游玩的标记（プレイ履歴里读得到时）
+      let bx = PAD + 390;
+      if (o.l) bx += pill(g, o.l, bx, y, LAMP_COLOR[o.l]) + 4;
+      const nx = Math.max(bx + 8, PAD + 450);
       const before = pbAt.get(o);
       const isPB = (before >= 0 && o.s > before) || (before < 0 && o.nr);
-      if (before >= 0 && o.s > before) { g.fillStyle = '#7ee0a0'; g.fillText('NEW RECORD  +' + (o.s - before).toLocaleString('en-US'), PAD + 410, y); }
-      else if (before < 0 && o.nr) { g.fillStyle = '#7ee0a0'; g.fillText('NEW RECORD', PAD + 410, y); }
-      else if (before >= 0) { g.fillStyle = '#ffffff66'; g.font = '14px ' + FONT; g.fillText('距最佳 −' + (before - o.s).toLocaleString('en-US'), PAD + 410, y); }
+      g.font = 'bold 15px ' + FONT;
+      if (before >= 0 && o.s > before) { g.fillStyle = GOOD; g.fillText('NEW RECORD  +' + (o.s - before).toLocaleString('en-US'), nx, y); }
+      else if (before < 0 && o.nr) { g.fillStyle = GOOD; g.fillText('NEW RECORD', nx, y); }
+      else if (before >= 0) { g.fillStyle = '#ffffff66'; g.font = '14px ' + FONT; g.fillText('距最佳 −' + (before - o.s).toLocaleString('en-US'), nx, y); }
       // 单曲 Rating：刷新最佳时显示变化，其他游玩用灰色显示这次分数对应的 Rating
-      if (isPB) ratingChange(g, HW - PAD, y, before >= 0 ? before : null, o.s, cInfo, 15);
+      if (isPB) ratingChange(g, rx, y, before >= 0 ? before : null, o.s, cInfo, 15);
       else if (cInfo.c) {
         g.textAlign = 'right'; g.fillStyle = '#ffffff66'; g.font = '14px ' + FONT;
-        g.fillText('Rating ' + floor2(songRating(o.s, cInfo.c)), HW - PAD, y);
+        g.fillText('Rating ' + (centsOf(o.s, cInfo.c) / 100).toFixed(2), rx, y);
         g.textAlign = 'left';
       }
       y += ROW;
     });
     const d = new Date();
     g.fillStyle = '#ffffff66'; g.font = '13px ' + FONT;
-    g.fillText('Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() + '  ·  data: CHUNITHM-NET プレイ履歴', PAD, H - 20);
+    g.fillText('Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() + '  ·  data: CHUNITHM-NET プレイ履歴 / 成绩扫描  ·  * = 由成绩扫描发现', PAD, H - 20);
     return cv;
   }
 
