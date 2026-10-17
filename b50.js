@@ -1609,6 +1609,16 @@
     return w;
   }
 
+  // 一首歌在这段时间里的推分合起来写：「最初分数 → 最后分数（+差）· 最初标记→最后标记 · 共 n 次推分」
+  const firstLast = (en) => {
+    const f = (x) => x.toLocaleString('en-US');
+    let t = en.s0 == null ? f(en.s1) + '（首次）'
+      : en.s1 > en.s0 ? f(en.s0) + ' → ' + f(en.s1) + '（+' + f(en.s1 - en.s0) + '）' : f(en.s1);
+    if (en.l1 && en.l1 !== (en.l0 || '')) t += ' · ' + (en.l0 == null ? en.l1 : (en.l0 || 'CLEAR') + '→' + en.l1);
+    if (en.n > 1) t += ' · 共 ' + en.n + ' 次推分';
+    return t;
+  };
+
   // range：{from, to, label}（'YYYY/MM/DD HH:MM'），null = 全部。
   //   走势线画这段时间（再接上开始前最后一个快照），B50 变化比较「开始时 → 结束时」，推分只列这段时间里的
   //   onlyRated：推分列表只列让账号 Rating 变了的（没进 B50、进了但没进位、只有标记提升的都不列）
@@ -1651,8 +1661,9 @@
     let upMore = 0;
     if (range) {
       // 这段时间里的推分带来的 B50 变化（按推分的时间，比快照更准）：新进 / 提升 / 被挤出
-      const mem = new Map(); // k → {start, end, before, after, why}
-      const entry = (k, start) => { if (!mem.has(k)) mem.set(k, { start, end: start, before: null, after: null, why: [] }); return mem.get(k); };
+      // k → {start, end, before, after（单曲 Rating）, s0 / s1（最初 / 最后的分数）, l0 / l1（最初 / 最后的标记）, n（推分次数）}
+      const mem = new Map();
+      const entry = (k, start) => { if (!mem.has(k)) mem.set(k, { start, end: start, before: null, after: null, s0: null, s1: null, l0: null, l1: null, n: 0 }); return mem.get(k); };
       updates.filter((u) => inRange(u.t)).forEach((u) => {
         const im = impact.get(u);
         if (!im || !im.frame) return;
@@ -1661,7 +1672,11 @@
           en.end = true;
           if (en.before == null && !im.entered && u.before) en.before = centsOf(u.before.s, constOf(u.k, u.n, u.d, db).c);
           en.after = centsOf(u.after.s, constOf(u.k, u.n, u.d, db).c);
-          en.why.push(changeText(u));
+          // 同一首歌推了几次：只记最初和最后的分数 / 标记
+          if (!en.n) { en.s0 = u.before ? u.before.s : null; en.l0 = u.before && u.before.has.l ? u.before.l : null; }
+          en.n++;
+          en.s1 = u.after.s;
+          if (u.after.has.l) en.l1 = u.after.l;
         }
         if (im.out) {
           const en = entry(im.out, true);
@@ -1672,7 +1687,7 @@
       const ups = [];
       mem.forEach((en, k) => {
         const e = [k, nameOf.get(k) || k];
-        if (!en.start && en.end) rows.push({ side: 'L', e, color: GOOD, right: '新进 ' + (en.after / 100).toFixed(2), sub: en.why.join(' / ') });
+        if (!en.start && en.end) rows.push({ side: 'L', e, color: GOOD, right: '新进 ' + (en.after / 100).toFixed(2), sub: firstLast(en) });
         else if (en.start && !en.end) rows.push({ side: 'R', e, color: '#ff8a8a', right: '移出 ' + (en.after / 100).toFixed(2) });
         else if (en.start && en.end) ups.push({ e, dr: en.after - (en.before == null ? en.after : en.before), en });
       });
@@ -1682,7 +1697,7 @@
         side: 'L', e, color: dr > 0 ? '#ffd65a' : '#ffffff77',
         right: dr > 0 ? (en.before / 100).toFixed(2) + ' → ' + (en.after / 100).toFixed(2) + '（+' + (dr / 100).toFixed(2) + '）'
           : (en.after / 100).toFixed(2) + '（rating 不变）',
-        sub: en.why.join(' / '),
+        sub: firstLast(en),
       }));
     } else if (hasPrev) {
       const toMap = (s) => new Map([...s.best, ...s.news].map((e) => [e[0], e]));
@@ -1692,7 +1707,7 @@
         const o = a.get(k);
         if (!o) { rows.push({ side: 'L', e, color: GOOD, right: '新进 ' + (rowCents(e) / 100).toFixed(2) }); return; }
         const why = [];
-        if (e[2] > o[2]) why.push('+' + (e[2] - o[2]).toLocaleString('en-US'));
+        if (e[2] > o[2]) why.push(o[2].toLocaleString('en-US') + ' → ' + e[2].toLocaleString('en-US') + '（+' + (e[2] - o[2]).toLocaleString('en-US') + '）');
         if (e[4] != null && o[4] != null && LAMP_RANK[e[4]] > LAMP_RANK[o[4]]) why.push((o[4] || 'CLEAR') + '→' + e[4]);
         const dr = rowCents(e) - rowCents(o);
         if (why.length || dr > 0) ups.push({ e, dr, why });
