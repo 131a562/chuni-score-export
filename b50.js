@@ -1077,8 +1077,17 @@
     apply.textContent = '应用';
     apply.style.cssText = btnCss + 'background:#7ee0ff;color:#222;margin:0;padding:4px 14px;font-size:14px;';
     rTo.after(apply);
+    // 推分只看让账号 Rating 变化的（选择会记住）
+    let onlyRated = !!store.get('onlyRated', false);
+    const orLabel = document.createElement('label');
+    orLabel.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:8px;font-size:14px;cursor:pointer;';
+    orLabel.innerHTML = '<input type="checkbox" style="width:18px;height:18px;margin:0;"> 推分只看账号 Rating 有变化的';
+    const orBox = orLabel.querySelector('input');
+    orBox.checked = onlyRated;
+    orBox.onchange = () => { onlyRated = orBox.checked; store.set('onlyRated', onlyRated); drawTrendNow(); };
+    rangeCard.appendChild(orLabel);
     const paintRange = () => {
-      const r = rangeOf(rangeSel);
+      const r = rangeOf(rangeSel, hist);
       rbtns.innerHTML = '';
       RANGE_PRESETS.forEach(([kind, label]) => {
         const b = document.createElement('button');
@@ -1112,7 +1121,7 @@
     trendBox.textContent = '正在生成走势图…';
     const drawTrendNow = () => {
       trendBox.textContent = '正在生成走势图…';
-      renderImages(trendBox, [() => drawTrend(hist, player, db, rangeOf(rangeSel))], 'chunithm-history', { inline: true })
+      renderImages(trendBox, [() => drawTrend(hist, player, db, rangeOf(rangeSel, hist), onlyRated)], 'chunithm-history', { inline: true })
         .catch((err) => { trendBox.textContent = '走势图生成失败：' + (err.message || err); });
     };
 
@@ -1172,7 +1181,7 @@
         const s = enrich({ idx, diff: e.d, title: e.n, score: pb[e.k] || 0 }, db);
         if (s.jacket) await loadJackets([s], (t) => { if (seq === curveSeq) curveBox.textContent = t; });
         if (seq !== curveSeq) return;
-        await renderImages(curveBox, [() => drawSongCurve(hist, e, s, player, db, rangeOf(rangeSel))],
+        await renderImages(curveBox, [() => drawSongCurve(hist, e, s, player, db, rangeOf(rangeSel, hist))],
           'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40), {
             inline: true,
             back: { label: '收起', fn: () => { openCurve = null; curveBox.style.display = 'none'; sec.scrollIntoView({ block: 'start' }); } },
@@ -1188,17 +1197,28 @@
   }
 
   // 时间段的快捷按钮 [kind, 文字, 往前几天（含今天）]。日期按日本时间
-  const RANGE_PRESETS = [['today', '今天', 0], ['7d', '最近 7 天', 6], ['30d', '最近 30 天', 29], ['all', '全部', null]];
+  const RANGE_PRESETS = [['since', '上次以来', null], ['today', '今天', 0], ['7d', '最近 7 天', 6], ['30d', '最近 30 天', 29], ['all', '全部', null]];
   const shiftDay = (ymd, n) => {
     const [y, m, d] = ymd.split('/').map(Number);
     const dt = new Date(Date.UTC(y, m - 1, d + n));
     return dt.getUTCFullYear() + '/' + pad2(dt.getUTCMonth() + 1) + '/' + pad2(dt.getUTCDate());
   };
+  const addMinute = (t) => {
+    const m = t.match(/(\d+)\/(\d+)\/(\d+) (\d+):(\d+)/);
+    const d = new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5] + 1));
+    return d.getUTCFullYear() + '/' + pad2(d.getUTCMonth() + 1) + '/' + pad2(d.getUTCDate()) + ' ' + pad2(d.getUTCHours()) + ':' + pad2(d.getUTCMinutes());
+  };
   // 选择 → {from, to, label}（'YYYY/MM/DD HH:MM'）；全部 → null
-  const rangeOf = (sel) => {
+  //   上次以来：上一次读取（倒数第二次完整扫描 / 快照）之后 → 这次读取。上一次读取时发现的推分不算
+  const rangeOf = (sel, hist) => {
     if (!sel || sel.kind === 'all') return null;
+    if (sel.kind === 'since') {
+      const runs = [...new Set([...(hist.scans || []).map((x) => x.split('|')[0]), ...hist.snaps.map((x) => x.t)])].sort();
+      if (runs.length < 2) return null;
+      return { from: addMinute(runs[runs.length - 2]), to: runs[runs.length - 1], label: '上次以来' };
+    }
     if (sel.kind === 'custom' && sel.from && sel.to) {
-      return { from: sel.from + ' 00:00', to: sel.to + ' 23:59', label: sel.from.slice(5) + '–' + sel.to.slice(5) };
+      return { from: sel.from + ' 00:00', to: sel.to + ' 23:59', label: sel.from === sel.to ? sel.from.slice(5) : sel.from.slice(5) + '–' + sel.to.slice(5) };
     }
     const p = RANGE_PRESETS.find((x) => x[0] === sel.kind);
     if (!p || p[2] == null) return null;
@@ -1338,7 +1358,8 @@
     const pts = series.flatMap((s) => s.pts);
     let t0 = Math.min(...pts.map((p) => p[0])), t1 = Math.max(...pts.map((p) => p[0]));
     let v0 = Math.min(...pts.map((p) => p[1])), v1 = Math.max(...pts.map((p) => p[1]));
-    if (t1 - t0 < 864e5) { t0 -= 432e5; t1 += 432e5; }
+    if (opt.xLabels) { t0 = -0.5; t1 = Math.max(opt.xLabels.length - 1, 0) + 0.5; } // 等间隔：两端各留半格
+    else if (t1 - t0 < 864e5) { t0 -= 432e5; t1 += 432e5; }
     const span = Math.max(v1 - v0, opt.minSpan);
     const mid = (v0 + v1) / 2;
     v0 = mid - span * 0.6; v1 = mid + span * 0.6;
@@ -1363,11 +1384,17 @@
     });
     // 时间刻度
     g.textAlign = 'center'; g.fillStyle = '#ffffff88';
-    const ticks = Math.min(6, Math.max(2, Math.round((t1 - t0) / 864e5) + 1));
-    for (let i = 0; i < ticks; i++) {
-      const t = t0 + (t1 - t0) * i / (ticks - 1);
-      const d = new Date(t);
-      g.fillText((d.getMonth() + 1) + '/' + d.getDate(), X(t), B + 24);
+    if (opt.xLabels) {
+      // 点太多时只标一部分（最多 8 个），保证首尾都标
+      const n = opt.xLabels.length, step = Math.max(1, Math.ceil(n / 8));
+      opt.xLabels.forEach((lb, i) => { if (i % step === 0 || i === n - 1) g.fillText(lb, X(i), B + 24); });
+    } else {
+      const ticks = Math.min(6, Math.max(2, Math.round((t1 - t0) / 864e5) + 1));
+      for (let i = 0; i < ticks; i++) {
+        const t = t0 + (t1 - t0) * i / (ticks - 1);
+        const d = new Date(t);
+        g.fillText((d.getMonth() + 1) + '/' + d.getDate(), X(t), B + 24);
+      }
     }
     g.textAlign = 'left';
     series.forEach((s) => {
@@ -1482,6 +1509,7 @@
         let low = null, lowV = Infinity;
         m.forEach((x, kk) => { if (keep && kk === k) return; if (x < lowV || (x === lowV && kk === k)) { low = kk; lowV = x; } });
         m.delete(low);
+        if (low !== k) return { entered: !was, inFrame: true, out: low, outCents: lowV }; // 挤掉了别的歌
       }
       return { entered: !was && m.has(k), inFrame: m.has(k) };
     };
@@ -1546,9 +1574,11 @@
       let cur = t0;
       steps.forEach((x, k) => {
         const delta = Math.floor((cur + x.d) / 50) - Math.floor(cur / 50);
+        x.res.ratingBefore = Math.floor(cur / 50); // 这次推分前后的账号 Rating（0.01 单位），按时间段统计时用
         cur += x.d;
         if (x.res.frame) { x.res.delta = delta; x.res.exact = x.d / 50 / 100; }
         if (gap && k === steps.length - 1) x.res.gap = gap;
+        x.res.ratingAfter = Math.floor(cur / 50) + (k === steps.length - 1 ? gap : 0);
         out.set(x.u, x.res);
       });
     });
@@ -1581,7 +1611,8 @@
 
   // range：{from, to, label}（'YYYY/MM/DD HH:MM'），null = 全部。
   //   走势线画这段时间（再接上开始前最后一个快照），B50 变化比较「开始时 → 结束时」，推分只列这段时间里的
-  function drawTrend(hist, player, db, range) {
+  //   onlyRated：推分列表只列让账号 Rating 变了的（没进 B50、进了但没进位、只有标记提升的都不列）
+  function drawTrend(hist, player, db, range, onlyRated) {
     const { updates } = derive(hist);
     const impact = accountImpact(hist, updates, db); // 账号 Rating 的影响要用全部记录算，显示时再按时间段筛
     const inRange = (t) => !range || (t >= range.from && t <= range.to);
@@ -1596,10 +1627,64 @@
     // 快照里存的单曲 Rating 可能是旧公式算的，按分数用现在的公式重算
     const rowCents = (e) => centsOf(e[2], constOf(e[0], e[1], diffOfKey(e[0]), db).c);
 
-    // 和上一次快照相比：B50 的进出与提升（分数、标记都算）
+    // 某个时刻的账号 Rating（0.01 单位）：那之前最后一次推分后的值（按推分的时间算），没有就用那之前最后一个快照。
+    // strict = 不含这个时刻（「开始前」）
+    const ratingAt = (t, strict) => {
+      const ok = (x) => (strict ? x < t : x <= t);
+      let best = null;
+      allSnaps.forEach((sn) => { if (sn.r && ok(sn.t) && (!best || sn.t >= best.t)) best = { t: sn.t, r: Math.round(sn.r * 100) }; });
+      updates.forEach((u) => {
+        const im = impact.get(u);
+        if (im && im.ratingAfter != null && ok(u.t) && (!best || u.t >= best.t)) best = { t: u.t, r: im.ratingAfter };
+      });
+      return best ? best.r : null;
+    };
+    const startR = range ? ratingAt(range.from, true) : null;
+    const endR = range ? ratingAt(range.to, false) : null;
+    // 时间段在同一天之内（今天 / 自选的同一天 / 上次以来在同一天）：走势图按每次 Rating 上涨等间隔画
+    const sameDay = range && range.from.slice(0, 10) === range.to.slice(0, 10);
+    const nameOf = new Map();
+    allSnaps.forEach((sn) => [...sn.best, ...sn.news].forEach((e) => nameOf.set(e[0], e[1])));
+    hist.obs.forEach((o) => nameOf.set(o.k, o.n));
+
     const rows = []; // {side:'L'|'R', e, color, right, sub}
     let upMore = 0;
-    if (hasPrev) {
+    if (range) {
+      // 这段时间里的推分带来的 B50 变化（按推分的时间，比快照更准）：新进 / 提升 / 被挤出
+      const mem = new Map(); // k → {start, end, before, after, why}
+      const entry = (k, start) => { if (!mem.has(k)) mem.set(k, { start, end: start, before: null, after: null, why: [] }); return mem.get(k); };
+      updates.filter((u) => inRange(u.t)).forEach((u) => {
+        const im = impact.get(u);
+        if (!im || !im.frame) return;
+        if (im.inFrame) {
+          const en = entry(u.k, !im.entered);
+          en.end = true;
+          if (en.before == null && !im.entered && u.before) en.before = centsOf(u.before.s, constOf(u.k, u.n, u.d, db).c);
+          en.after = centsOf(u.after.s, constOf(u.k, u.n, u.d, db).c);
+          en.why.push(changeText(u));
+        }
+        if (im.out) {
+          const en = entry(im.out, true);
+          en.end = false;
+          if (en.after == null) en.after = im.outCents;
+        }
+      });
+      const ups = [];
+      mem.forEach((en, k) => {
+        const e = [k, nameOf.get(k) || k];
+        if (!en.start && en.end) rows.push({ side: 'L', e, color: GOOD, right: '新进 ' + (en.after / 100).toFixed(2), sub: en.why.join(' / ') });
+        else if (en.start && !en.end) rows.push({ side: 'R', e, color: '#ff8a8a', right: '移出 ' + (en.after / 100).toFixed(2) });
+        else if (en.start && en.end) ups.push({ e, dr: en.after - (en.before == null ? en.after : en.before), en });
+      });
+      ups.sort((p, q) => q.dr - p.dr);
+      upMore = Math.max(0, ups.length - 10);
+      ups.slice(0, 10).forEach(({ e, dr, en }) => rows.push({
+        side: 'L', e, color: dr > 0 ? '#ffd65a' : '#ffffff77',
+        right: dr > 0 ? (en.before / 100).toFixed(2) + ' → ' + (en.after / 100).toFixed(2) + '（+' + (dr / 100).toFixed(2) + '）'
+          : (en.after / 100).toFixed(2) + '（rating 不变）',
+        sub: en.why.join(' / '),
+      }));
+    } else if (hasPrev) {
       const toMap = (s) => new Map([...s.best, ...s.news].map((e) => [e[0], e]));
       const a = toMap(prev), b = toMap(last);
       const ups = [];
@@ -1623,7 +1708,11 @@
       }));
       a.forEach((e, k) => { if (!b.has(k)) rows.push({ side: 'R', e, color: '#ff8a8a', right: '移出 ' + (rowCents(e) / 100).toFixed(2) }); });
     }
-    const inR = updates.filter((u) => inRange(u.t));
+    const inRAll = updates.filter((u) => inRange(u.t));
+    // 只看这次推分本身带来的变化（「另有 … 来自没记录到的变化」不是这次推分带来的，不算）
+    const rated = (u) => { const im = impact.get(u); return !!im && (im.delta || 0) !== 0; };
+    const inR = onlyRated ? inRAll.filter(rated) : inRAll;
+    const hiddenN = inRAll.length - inR.length;
     const RECENT_MAX = range ? 30 : 20;
     const recent = inR.slice(-RECENT_MAX).reverse();
     const recentMore = inR.length - recent.length;
@@ -1648,13 +1737,13 @@
     };
     const line = daily((s) => s.r);
     const rx = HW - PAD;
-    if (line.length && last) {
+    if (range && endR != null) {
+      stat(g, 'RATING', (endR / 100).toFixed(2), rx, '#ffd65a', true);
+      stat(g, range.label, startR != null ? signed((endR - startR) / 100) : '-', rx - 230, '#7ee0ff');
+      stat(g, '累计', allSnaps[0] ? signed(endR / 100 - allSnaps[0].r) : '-', rx - 400, '#c9a2ff');
+    } else if (line.length && last) {
       const now = last.r;
-      if (range) {
-        stat(g, 'RATING', now.toFixed(2), rx, '#ffd65a', true);
-        stat(g, range.label, prev ? signed(now - prev.r) : '-', rx - 230, '#7ee0ff');
-        stat(g, '累计', signed(now - allSnaps[0].r), rx - 400, '#c9a2ff');
-      } else {
+      {
         const base30 = [...line].reverse().find((pt) => pt[0] <= Date.now() - 30 * 864e5) || line[0];
         stat(g, 'RATING', now.toFixed(2), rx, '#ffd65a', true);
         stat(g, '30 天', signed(now - base30[1]), rx - 230, '#7ee0ff');
@@ -1662,14 +1751,34 @@
       }
     }
     g.fillStyle = '#ffffff80'; g.font = '14px ' + FONT; g.textAlign = 'right';
-    const span = range ? range.label + '（' + range.from.slice(0, 10) + ' – ' + range.to.slice(0, 10) + '）'
+    const span = range ? range.label + '（' + (sameDay ? range.from.slice(0, 10) + ' ' + range.from.slice(11) + ' – ' + range.to.slice(11)
+      : range.from.slice(0, 10) + ' – ' + range.to.slice(0, 10)) + '）'
       : line.length ? line.length + ' 天的记录（' + new Date(line[0][0]).toLocaleDateString('ja-JP') + ' – ' + new Date(line[line.length - 1][0]).toLocaleDateString('ja-JP') + '）' : '';
     g.fillText(span + (hist.since ? '　·　从 ' + hist.since + ' 开始记录' : ''), rx, PAD + 122);
     g.textAlign = 'left';
     g.fillStyle = '#ffffff33'; g.fillRect(PAD, 148, HW - PAD * 2, 2);
 
     let y = 170;
-    if (line.length) {
+    if (sameDay) {
+      const pts = [], labels = [];
+      let curR = startR;
+      if (curR != null) { pts.push([0, curR / 100]); labels.push(range.from.slice(11) === '00:00' ? '0:00' : range.from.slice(11)); }
+      updates.filter((u) => inRange(u.t)).forEach((u) => {
+        const im = impact.get(u);
+        if (!im || im.ratingAfter == null) return;
+        if (curR == null) { curR = im.ratingBefore; pts.push([0, curR / 100]); labels.push('开始'); }
+        if (im.ratingAfter > curR) { curR = im.ratingAfter; pts.push([pts.length, curR / 100]); labels.push(u.t.slice(11)); }
+      });
+      if (pts.length) {
+        lineChart(g, PAD, y, HW - PAD * 2, 440, [
+          { label: 'RATING（每次上涨）', color: '#ffd65a', pts, width: 4, dot: 6 },
+        ], { minSpan: 0.05, fmt: (v) => v.toFixed(2), xLabels: labels });
+      }
+      if (pts.length <= 1) {
+        g.fillStyle = '#ffffffaa'; g.font = '16px ' + FONT; g.textAlign = 'center';
+        g.fillText(pts.length ? '这段时间里账号 Rating 没有上涨' : '这段时间里没有记录', HW / 2, y + 60); g.textAlign = 'left';
+      }
+    } else if (line.length) {
       lineChart(g, PAD, y, HW - PAD * 2, 440, [
         { label: 'RATING（每天）', color: '#ffd65a', pts: line, width: 4 },
         { label: 'BEST 30 平均', color: '#c9a2ff', pts: daily((s) => s.b30), width: 2, dot: 3 },
@@ -1683,8 +1792,16 @@
     y += 460;
 
     // B50 变化：标题行右边写两次快照之间账号 Rating 的实际变化，以及 BEST 30 / NEW 20 各自对账号 Rating 的贡献变化
-    sectionTitle(g, 'B50 变化' + (hasPrev ? (range ? '（' + prev.t + ' → ' + last.t + '）' : '（对比 ' + prev.t + '）') : ''), y, '#c9a2ff');
-    if (hasPrev) {
+    sectionTitle(g, 'B50 变化' + (range ? '（' + range.label + '）' : hasPrev ? '（对比 ' + prev.t + '）' : ''), y, '#c9a2ff');
+    if (range && startR != null && endR != null) {
+      const dr = endR - startR;
+      g.textAlign = 'right'; g.font = 'bold 18px ' + FONT;
+      g.fillStyle = dr > 0 ? GOOD : dr < 0 ? '#ff8a8a' : '#ffffff88';
+      g.fillText('账号 Rating ' + (startR / 100).toFixed(2) + ' → ' + (endR / 100).toFixed(2) + '　' + (dr > 0 ? '+' : dr < 0 ? '−' : '±') + (Math.abs(dr) / 100).toFixed(2), rx, y + 32);
+      g.font = '14px ' + FONT; g.fillStyle = '#ffffff88';
+      g.fillText('按推分的游玩时间统计（成绩扫描发现的推分按读取的时间）', rx, y + 56);
+      g.textAlign = 'left';
+    } else if (!range && hasPrev) {
       const dr = Math.round((last.r - prev.r) * 100);
       g.textAlign = 'right'; g.font = 'bold 18px ' + FONT;
       g.fillStyle = dr > 0 ? GOOD : dr < 0 ? '#ff8a8a' : '#ffffff88';
@@ -1710,8 +1827,8 @@
       return ROW + (r.sub ? SUBROW : 0);
     };
     g.font = 'bold 15px ' + FONT;
-    if (!hasPrev) {
-      g.fillStyle = '#ffffff88'; g.fillText(range ? '这段时间里没有可以对比的两次快照' : '还没有上一次的快照可以对比', PAD, y);
+    if (!range && !hasPrev) {
+      g.fillStyle = '#ffffff88'; g.fillText('还没有上一次的快照可以对比', PAD, y);
     } else if (!rows.length) {
       g.fillStyle = '#ffffff88'; g.fillText(range ? '这段时间里 B50 没有变化' : '和上次相比没有变化', PAD, y);
     } else {
@@ -1725,11 +1842,17 @@
 
     // 推分记录：每条两行。上行 时间 / 难度 / 曲名 / 推分内容；下行 对账号 Rating 的影响 / 单曲 Rating 的变化
     y += 6;
-    sectionTitle(g, range ? '推分（' + range.label + '，' + inR.length + ' 次）' : '最近的推分', y, '#ffd65a');
+    sectionTitle(g, (range ? '推分（' + range.label + '，' + inR.length + ' 次）' : '最近的推分') + (onlyRated ? '　只看账号 Rating 有变化的' : ''), y, '#ffd65a');
+    if (onlyRated && hiddenN) {
+      g.textAlign = 'right'; g.fillStyle = '#ffffff88'; g.font = '14px ' + FONT;
+      g.fillText('另有 ' + hiddenN + ' 次推分没有让账号 Rating 变化（已隐藏）', HW - PAD, y + 34);
+      g.textAlign = 'left';
+    }
     y += 64;
     if (!recent.length) {
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
-      g.fillText(range ? '这段时间里没有推分' : '暂无记录。分数、FC/AJ 标记有提升时会记在这里', PAD, y);
+      g.fillText(onlyRated ? (range ? '这段时间里没有让账号 Rating 变化的推分' : '还没有让账号 Rating 变化的推分')
+        : range ? '这段时间里没有推分' : '暂无记录。分数、FC/AJ 标记有提升时会记在这里', PAD, y);
     }
     recent.forEach((u) => {
       g.fillStyle = '#ffffff88'; g.font = '14px ' + FONT;
