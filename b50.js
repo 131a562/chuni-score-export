@@ -4,6 +4,8 @@
   'use strict';
 
   const TEST = window.__B50_TEST__ || null;
+  // 打开书签时读到的数据 { player, best, news, all, db, at }（见「读取」）。fail() 一开始就可能用到，所以放在最前面
+  let DATA = null;
   const TEST_DB = (TEST && TEST.db) || { byId: new Map(), byTitle: new Map(), byImage: new Map() };
   const CONST_URL = 'https://raw.githubusercontent.com/zvuc/otoge-db/master/chunithm/data/music-ex.json';
   const HOST = location.hostname;
@@ -56,6 +58,12 @@
     say('');
     status.style.cssText += 'background:#c62f3b33;border:1px solid #c62f3b;border-radius:10px;padding:16px;';
     status.textContent = '出错了：' + t;
+    // 数据已经读好了就回菜单；还没读好（打开时读取失败）就重试
+    const b = document.createElement('button');
+    b.textContent = DATA ? '返回菜单' : '重试';
+    b.style.cssText = btnCss + 'background:#ffffff22;color:#fff;padding:8px 20px;margin:12px 0 0;';
+    b.onclick = DATA ? showMenu : start;
+    box.appendChild(b);
   };
   const btnCss = '-webkit-appearance:none;display:inline-block;margin:8px;padding:12px 26px;border:0;border-radius:999px;font:bold 16px ' + FONT + ';cursor:pointer;';
 
@@ -71,8 +79,33 @@
   // 清理旧版本保存的 GitHub Token（现在由同步服务保管，浏览器里不再需要）
   try { localStorage.removeItem('b50:gh'); } catch (e) { /* 忽略 */ }
 
+  // ---------- 读取 ----------
+  // 打开书签时一次读完：玩家信息、B50、EXPERT / MASTER / ULTIMA 全曲成绩、プレイ履歴，并记录历史、同步。
+  // 之后生成 B50 / 按定数筛选 / 历史走势都用这份数据，不再重新获取；要最新数据时点「重新读取」
+
+  async function loadAll() {
+    const { player, best, news, db } = await readB50();
+    if (aborted) return;
+    const hist = await recordAndSync({ player, best, news, db }); // 全曲成绩也在这里读（lastRun.all）
+    if (aborted) return;
+    DATA = { player, best, news, all: (lastRun && lastRun.all) || [], db, at: nowStr() };
+    histView = { hist, player, db };
+  }
+
+  function start() {
+    return run(async () => {
+      await loadAll();
+      if (!aborted) showMenu();
+    });
+  }
+
+  // 「重新读取」：重新获取后回到 then（菜单 / 历史走势页）
+  const reload = (then) => run(async () => {
+    await loadAll();
+    if (!aborted) then();
+  });
+
   // ---------- 菜单 ----------
-  showMenu();
 
   function showMenu() {
     box.innerHTML = '';
@@ -90,17 +123,28 @@
     const b3 = document.createElement('button');
     b3.textContent = '历史走势';
     b3.style.cssText = btnCss + 'background:#c9a2ff;color:#222;';
-    // 这次打开书签后读到过数据就直接显示，不重新读取（历史走势页里有「重新读取」）
-    b3.onclick = () => (histView ? showHistoryPanel(histView.hist, histView.player, histView.db) : run(runHistory));
+    b3.onclick = () => showHistoryPanel(histView.hist, histView.player, histView.db);
+    const small = 'background:#ffffff22;color:#fff;padding:8px 20px;font-size:14px;';
+    const b5 = document.createElement('button');
+    b5.textContent = '重新读取';
+    b5.style.cssText = btnCss + small;
+    b5.onclick = () => reload(showMenu);
     const b4 = document.createElement('button');
     b4.textContent = '同步账号';
-    b4.style.cssText = btnCss + 'background:#ffffff22;color:#fff;padding:8px 20px;font-size:14px;';
+    b4.style.cssText = btnCss + small;
     b4.onclick = showAccounts;
+    // 这次读到的数据
+    const info = document.createElement('div');
+    info.style.cssText = 'margin:-6px 0 14px;font-size:13px;color:#ffffffaa;';
+    if (DATA) {
+      info.textContent = DATA.player.name + '　·　Rating ' + (DATA.player.rating || '-') + '　·　' + DATA.all.length + ' 首成绩　·　' +
+        DATA.at.slice(11) + ' 读取';
+    }
     const note = document.createElement('div');
     note.style.cssText = 'margin-top:14px;font-size:13px;color:#ffffff99;';
-    note.textContent = SYNC_URL ? '历史记录会自动同步，首次同步时会询问要存入的玩家名' : '历史记录仅保存在本机';
-    wrap.append(b1, document.createElement('br'), b2, document.createElement('br'), b3);
-    if (SYNC_URL) wrap.append(document.createElement('br'), b4);
+    note.textContent = syncNote || (SYNC_URL ? '' : '历史记录仅保存在本机');
+    wrap.append(info, b1, document.createElement('br'), b2, document.createElement('br'), b3, document.createElement('br'), b5);
+    if (SYNC_URL) wrap.append(b4);
     wrap.append(note);
     box.appendChild(wrap);
   }
@@ -342,11 +386,9 @@
   const floor2 = (x) => (Math.floor(x * 100 + 1e-6) / 100).toFixed(2);
 
   // ---------- B50 ----------
+  // 用打开时读到的数据（DATA），不重新获取
   async function runB50() {
-    const { player, best, news, db } = await readB50();
-    if (aborted) return;
-    histView = { hist: await recordAndSync({ player, best, news, db }), player, db };
-    if (aborted) return;
+    const { player, best, news } = DATA;
     await loadJackets([...best, ...news]);
     if (aborted) return;
     await showResult([() => drawB50(player, best, news)], 'chunithm-b50');
@@ -382,21 +424,11 @@
   }
 
   // ---------- 定数筛选 ----------
+  // 从打开时读到的全曲成绩（DATA.all，EXPERT / MASTER / ULTIMA）里按难度挑，不重新获取
   async function runFilter(opt) {
-    let player, all;
-    if (TEST) {
-      ({ player, all } = TEST);
-      all = all.filter((s) => opt.diffs.includes(s.diff));
-    } else {
-      say('正在读取玩家信息…');
-      player = (await readPlayer()).player;
-      all = await readAllScores(opt.diffs);
-      if (aborted) return;
-      if (!all.length) throw new Error('没有读到成绩。需要开通 CHUNITHM-NET スタンダードコース，或页面结构已变更。');
-    }
-    const db = TEST ? TEST_DB : await loadConstDb();
-    histView = { hist: await recordAndSync({ player, all, db, scanDiffs: opt.diffs }), player, db };
-    if (aborted) return;
+    const { player, db } = DATA;
+    if (!DATA.all.length) throw new Error('打开时没有读到全曲成绩（需要开通 CHUNITHM-NET スタンダードコース，或页面结构已变更）。可以在菜单里「重新读取」。');
+    const all = DATA.all.filter((s) => opt.diffs.includes(s.diff));
     const eps = 1e-6;
     let list = all.map((s) => enrich(s, db))
       .filter((s) => s.constant >= opt.min - eps && s.constant <= opt.max + eps);
@@ -948,13 +980,7 @@
   // 最近一次读到的历史（任何功能运行后都会更新）。从菜单再进「历史走势」时直接用它，不用重新读取
   let histView = null;
 
-  async function runHistory() {
-    const { player, best, news, db } = await readB50();
-    if (aborted) return;
-    const hist = await recordAndSync({ player, best, news, db });
-    if (aborted) return;
-    showHistoryPanel(hist, player, db);
-  }
+  const showHistory = () => showHistoryPanel(histView.hist, histView.player, histView.db);
 
   // 历史走势页（同 ongeki-score-export）：概况 + 走势图 + 单曲分数曲线。图都画在页面里，点曲目不用离开这个页面
   function showHistoryPanel(hist, player, db) {
@@ -991,8 +1017,8 @@
     };
     const small = 'background:#ffffff22;color:#fff;margin:4px 8px 4px 0;padding:8px 16px;font-size:14px;';
     mk('返回菜单', small, showMenu);
-    // 重新读取 CHUNITHM-NET 的数据（离开页面再回来时用的是上次读到的）
-    mk('重新读取', small, () => run(runHistory));
+    // 重新读取 CHUNITHM-NET 的数据（平时用的是打开书签时读到的）
+    mk('重新读取', small, () => reload(showHistory));
     if (SYNC_URL) {
       mk('更改同步名字', small, () => run(async () => {
         const h = await recordAndSync(lastRun, { forceAsk: true });
@@ -1035,9 +1061,60 @@
       try { await navigator.clipboard.writeText(text); alert('调试信息已复制，粘贴发给开发者即可。'); } catch (e) { ta.focus(); ta.select(); }
     });
 
+    // 时间段：快捷按钮 + 自选起止日期。走势图、B50 变化、推分、单曲曲线都按它显示（选择会记住）
+    let rangeSel = store.get('histRange', { kind: 'all' });
+    // 以前选过、现在已经没有的快捷按钮（例：最近 90 天）当作「全部」
+    if (rangeSel.kind !== 'custom' && !RANGE_PRESETS.some((p) => p[0] === rangeSel.kind)) rangeSel = { kind: 'all' };
+    const rangeCard = card('padding:10px 14px;');
+    const dateCss = 'padding:4px 6px;border-radius:6px;border:1px solid #fff4;background:#0d1020;color:#fff;font:15px ' + FONT + ';color-scheme:dark;';
+    rangeCard.innerHTML = '<div style="font-weight:bold;margin-bottom:6px;">时间段</div><div id="b50-rbtns"></div>' +
+      '<div style="margin-top:6px;font-size:14px;display:flex;flex-wrap:wrap;align-items:center;gap:6px;">自选 ' +
+      '<input id="b50-rfrom" type="date" style="' + dateCss + '"> ～ <input id="b50-rto" type="date" style="' + dateCss + '"></div>';
+    const rbtns = rangeCard.querySelector('#b50-rbtns');
+    const rFrom = rangeCard.querySelector('#b50-rfrom'), rTo = rangeCard.querySelector('#b50-rto');
+    const toInput = (ymd) => ymd.split('/').join('-');
+    const apply = document.createElement('button');
+    apply.textContent = '应用';
+    apply.style.cssText = btnCss + 'background:#7ee0ff;color:#222;margin:0;padding:4px 14px;font-size:14px;';
+    rTo.after(apply);
+    const paintRange = () => {
+      const r = rangeOf(rangeSel);
+      rbtns.innerHTML = '';
+      RANGE_PRESETS.forEach(([kind, label]) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        const on = rangeSel.kind === kind;
+        b.style.cssText = btnCss + 'margin:3px 6px 3px 0;padding:6px 12px;font-size:14px;' + (on ? 'background:#c9a2ff;color:#222;' : 'background:#ffffff1a;color:#fff;');
+        b.onclick = () => setRange({ kind });
+        rbtns.appendChild(b);
+      });
+      // 日期框显示当前的时间段（全部 = 从开始记录到今天）
+      rFrom.value = toInput(r ? r.from.slice(0, 10) : (hist.since || nowStr()).slice(0, 10));
+      rTo.value = toInput(r ? r.to.slice(0, 10) : nowStr().slice(0, 10));
+      apply.style.background = rangeSel.kind === 'custom' ? '#c9a2ff' : '#7ee0ff';
+    };
+    const setRange = (sel) => {
+      rangeSel = sel;
+      store.set('histRange', sel);
+      paintRange();
+      drawTrendNow();
+      if (openCurve) showCurve(openCurve, false);
+    };
+    apply.onclick = () => {
+      let a = rFrom.value.split('-').join('/'), b = rTo.value.split('-').join('/');
+      if (!a || !b) { alert('请选择开始和结束日期'); return; }
+      if (a > b) [a, b] = [b, a];
+      setRange({ kind: 'custom', from: a, to: b });
+    };
+
     // 走势图：直接画在页面里
     const trendBox = card('padding:10px;text-align:center;color:#ffffffaa;');
     trendBox.textContent = '正在生成走势图…';
+    const drawTrendNow = () => {
+      trendBox.textContent = '正在生成走势图…';
+      renderImages(trendBox, [() => drawTrend(hist, player, db, rangeOf(rangeSel))], 'chunithm-history', { inline: true })
+        .catch((err) => { trendBox.textContent = '走势图生成失败：' + (err.message || err); });
+    };
 
     // 单曲分数曲线：只列出プレイ履歴里出现过、或有推分记录的谱面；点一首，曲线画在列表下面
     const pushed = new Set(updates.map((u) => u.k));
@@ -1075,34 +1152,59 @@
         row.innerHTML = '<span style="background:' + DIFFS[e.d].color + ';border-radius:4px;padding:0 6px;font-weight:bold;font-size:12px;">' +
           DIFFS[e.d].short + '</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(e.n) +
           '</span><span style="color:#ffffff99;font-size:12px;">' + (pb[e.k] || 0).toLocaleString('en-US') + '　' + e.plays + ' 次</span>';
-        row.onclick = async () => {
-          const seq = ++curveSeq; // 连续点了几首时，只显示最后点的那首
-          curveBox.style.display = '';
-          curveBox.textContent = '正在生成 ' + e.n + ' 的走势图…';
-          curveBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          try {
-            const idx = e.k.startsWith('n:') ? 'n' : e.k.split(':')[0];
-            const s = enrich({ idx, diff: e.d, title: e.n, score: pb[e.k] || 0 }, db);
-            if (s.jacket) await loadJackets([s], (t) => { if (seq === curveSeq) curveBox.textContent = t; });
-            if (seq !== curveSeq) return;
-            await renderImages(curveBox, [() => drawSongCurve(hist, e, s, player, db)],
-              'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40), {
-                inline: true,
-                back: { label: '收起', fn: () => { curveBox.style.display = 'none'; sec.scrollIntoView({ block: 'start' }); } },
-              });
-          } catch (err) {
-            if (seq === curveSeq) curveBox.textContent = '生成失败：' + (err.message || err);
-          }
-        };
+        row.onclick = () => showCurve(e, true);
         listEl.appendChild(row);
       });
     };
     sec.querySelector('#b50-q').oninput = render;
     render();
 
-    renderImages(trendBox, [() => drawTrend(hist, player, db)], 'chunithm-history', { inline: true })
-      .catch((err) => { trendBox.textContent = '走势图生成失败：' + (err.message || err); });
+    // 单曲曲线画在列表下面。切换时间段时重画当前打开的那首（scroll = false）
+    let openCurve = null;
+    async function showCurve(e, scroll) {
+      const seq = ++curveSeq; // 连续点了几首时，只显示最后点的那首
+      openCurve = e;
+      curveBox.style.display = '';
+      curveBox.textContent = '正在生成 ' + e.n + ' 的走势图…';
+      if (scroll) curveBox.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      try {
+        const idx = e.k.startsWith('n:') ? 'n' : e.k.split(':')[0];
+        const s = enrich({ idx, diff: e.d, title: e.n, score: pb[e.k] || 0 }, db);
+        if (s.jacket) await loadJackets([s], (t) => { if (seq === curveSeq) curveBox.textContent = t; });
+        if (seq !== curveSeq) return;
+        await renderImages(curveBox, [() => drawSongCurve(hist, e, s, player, db, rangeOf(rangeSel))],
+          'chunithm-' + e.n.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40), {
+            inline: true,
+            back: { label: '收起', fn: () => { openCurve = null; curveBox.style.display = 'none'; sec.scrollIntoView({ block: 'start' }); } },
+          });
+      } catch (err) {
+        if (seq === curveSeq) curveBox.textContent = '生成失败：' + (err.message || err);
+      }
+    }
+
+    paintRange();
+
+    drawTrendNow();
   }
+
+  // 时间段的快捷按钮 [kind, 文字, 往前几天（含今天）]。日期按日本时间
+  const RANGE_PRESETS = [['today', '今天', 0], ['7d', '最近 7 天', 6], ['30d', '最近 30 天', 29], ['all', '全部', null]];
+  const shiftDay = (ymd, n) => {
+    const [y, m, d] = ymd.split('/').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d + n));
+    return dt.getUTCFullYear() + '/' + pad2(dt.getUTCMonth() + 1) + '/' + pad2(dt.getUTCDate());
+  };
+  // 选择 → {from, to, label}（'YYYY/MM/DD HH:MM'）；全部 → null
+  const rangeOf = (sel) => {
+    if (!sel || sel.kind === 'all') return null;
+    if (sel.kind === 'custom' && sel.from && sel.to) {
+      return { from: sel.from + ' 00:00', to: sel.to + ' 23:59', label: sel.from.slice(5) + '–' + sel.to.slice(5) };
+    }
+    const p = RANGE_PRESETS.find((x) => x[0] === sel.kind);
+    if (!p || p[2] == null) return null;
+    const today = nowStr().slice(0, 10);
+    return { from: shiftDay(today, -p[2]) + ' 00:00', to: today + ' 23:59', label: p[1] };
+  };
 
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const signed = (x, digits) => (x >= 0 ? '+' : '−') + Math.abs(x).toFixed(digits == null ? 2 : digits);
@@ -1477,18 +1579,27 @@
     return w;
   }
 
-  function drawTrend(hist, player, db) {
+  // range：{from, to, label}（'YYYY/MM/DD HH:MM'），null = 全部。
+  //   走势线画这段时间（再接上开始前最后一个快照），B50 变化比较「开始时 → 结束时」，推分只列这段时间里的
+  function drawTrend(hist, player, db, range) {
     const { updates } = derive(hist);
-    const impact = accountImpact(hist, updates, db);
-    const snaps = hist.snaps;
-    const last = snaps[snaps.length - 1], prev = snaps[snaps.length - 2];
+    const impact = accountImpact(hist, updates, db); // 账号 Rating 的影响要用全部记录算，显示时再按时间段筛
+    const inRange = (t) => !range || (t >= range.from && t <= range.to);
+    const allSnaps = hist.snaps;
+    const upto = allSnaps.filter((s) => !range || s.t <= range.to);
+    const last = upto[upto.length - 1];
+    // 对比的起点：全部 = 上一次快照；时间段 = 开始前最后一个快照（没有就用这段时间里的第一个）
+    const prev = !range ? allSnaps[allSnaps.length - 2]
+      : [...allSnaps].reverse().find((s) => s.t < range.from) || allSnaps.find((s) => inRange(s.t));
+    const snaps = !range ? allSnaps : allSnaps.filter((s) => inRange(s.t) || s === prev);
+    const hasPrev = prev && last && prev !== last;
     // 快照里存的单曲 Rating 可能是旧公式算的，按分数用现在的公式重算
     const rowCents = (e) => centsOf(e[2], constOf(e[0], e[1], diffOfKey(e[0]), db).c);
 
     // 和上一次快照相比：B50 的进出与提升（分数、标记都算）
     const rows = []; // {side:'L'|'R', e, color, right, sub}
     let upMore = 0;
-    if (last && prev) {
+    if (hasPrev) {
       const toMap = (s) => new Map([...s.best, ...s.news].map((e) => [e[0], e]));
       const a = toMap(prev), b = toMap(last);
       const ups = [];
@@ -1512,11 +1623,14 @@
       }));
       a.forEach((e, k) => { if (!b.has(k)) rows.push({ side: 'R', e, color: '#ff8a8a', right: '移出 ' + (rowCents(e) / 100).toFixed(2) }); });
     }
-    const recent = updates.slice(-20).reverse();
+    const inR = updates.filter((u) => inRange(u.t));
+    const RECENT_MAX = range ? 30 : 20;
+    const recent = inR.slice(-RECENT_MAX).reverse();
+    const recentMore = inR.length - recent.length;
     const ROW = 34, SUBROW = 20, PB_ROW = 58;
     const colRows = (side) => rows.filter((r) => r.side === side).reduce((a, r) => a + ROW + (r.sub ? SUBROW : 0), 0);
     const changeH = Math.max(colRows('L') + (upMore ? ROW : 0), colRows('R'), ROW);
-    const H = 170 + 440 + 20 + 86 + changeH + 30 + 64 + Math.max(recent.length, 1) * PB_ROW + 60;
+    const H = 170 + 440 + 20 + 86 + changeH + 30 + 64 + Math.max(recent.length, 1) * PB_ROW + (recentMore ? 34 : 0) + 60;
     const { cv, g } = newCanvas(H, HW);
 
     // 头部。Rating 按天连线：每天取当天最后一次查询的值，点放在当天中午
@@ -1534,16 +1648,23 @@
     };
     const line = daily((s) => s.r);
     const rx = HW - PAD;
-    if (line.length) {
-      const now = line[line.length - 1][1];
-      const base30 = [...line].reverse().find((pt) => pt[0] <= Date.now() - 30 * 864e5) || line[0];
-      stat(g, 'RATING', now.toFixed(2), rx, '#ffd65a', true);
-      stat(g, '30 天', signed(now - base30[1]), rx - 230, '#7ee0ff');
-      stat(g, '累计', signed(now - line[0][1]), rx - 400, '#c9a2ff');
+    if (line.length && last) {
+      const now = last.r;
+      if (range) {
+        stat(g, 'RATING', now.toFixed(2), rx, '#ffd65a', true);
+        stat(g, range.label, prev ? signed(now - prev.r) : '-', rx - 230, '#7ee0ff');
+        stat(g, '累计', signed(now - allSnaps[0].r), rx - 400, '#c9a2ff');
+      } else {
+        const base30 = [...line].reverse().find((pt) => pt[0] <= Date.now() - 30 * 864e5) || line[0];
+        stat(g, 'RATING', now.toFixed(2), rx, '#ffd65a', true);
+        stat(g, '30 天', signed(now - base30[1]), rx - 230, '#7ee0ff');
+        stat(g, '累计', signed(now - line[0][1]), rx - 400, '#c9a2ff');
+      }
     }
     g.fillStyle = '#ffffff80'; g.font = '14px ' + FONT; g.textAlign = 'right';
-    g.fillText(line.length ? line.length + ' 天的记录（' + new Date(line[0][0]).toLocaleDateString('ja-JP') + ' – ' +
-      new Date(line[line.length - 1][0]).toLocaleDateString('ja-JP') + '）' + (hist.since ? '　·　从 ' + hist.since + ' 开始记录' : '') : '', rx, PAD + 122);
+    const span = range ? range.label + '（' + range.from.slice(0, 10) + ' – ' + range.to.slice(0, 10) + '）'
+      : line.length ? line.length + ' 天的记录（' + new Date(line[0][0]).toLocaleDateString('ja-JP') + ' – ' + new Date(line[line.length - 1][0]).toLocaleDateString('ja-JP') + '）' : '';
+    g.fillText(span + (hist.since ? '　·　从 ' + hist.since + ' 开始记录' : ''), rx, PAD + 122);
     g.textAlign = 'left';
     g.fillStyle = '#ffffff33'; g.fillRect(PAD, 148, HW - PAD * 2, 2);
 
@@ -1562,8 +1683,8 @@
     y += 460;
 
     // B50 变化：标题行右边写两次快照之间账号 Rating 的实际变化，以及 BEST 30 / NEW 20 各自对账号 Rating 的贡献变化
-    sectionTitle(g, 'B50 变化' + (prev ? '（对比 ' + prev.t + '）' : ''), y, '#c9a2ff');
-    if (prev) {
+    sectionTitle(g, 'B50 变化' + (hasPrev ? (range ? '（' + prev.t + ' → ' + last.t + '）' : '（对比 ' + prev.t + '）') : ''), y, '#c9a2ff');
+    if (hasPrev) {
       const dr = Math.round((last.r - prev.r) * 100);
       g.textAlign = 'right'; g.font = 'bold 18px ' + FONT;
       g.fillStyle = dr > 0 ? GOOD : dr < 0 ? '#ff8a8a' : '#ffffff88';
@@ -1589,10 +1710,10 @@
       return ROW + (r.sub ? SUBROW : 0);
     };
     g.font = 'bold 15px ' + FONT;
-    if (!prev) {
-      g.fillStyle = '#ffffff88'; g.fillText('还没有上一次的快照可以对比', PAD, y);
+    if (!hasPrev) {
+      g.fillStyle = '#ffffff88'; g.fillText(range ? '这段时间里没有可以对比的两次快照' : '还没有上一次的快照可以对比', PAD, y);
     } else if (!rows.length) {
-      g.fillStyle = '#ffffff88'; g.fillText('和上次相比没有变化', PAD, y);
+      g.fillStyle = '#ffffff88'; g.fillText(range ? '这段时间里 B50 没有变化' : '和上次相比没有变化', PAD, y);
     } else {
       let yy = y;
       rows.filter((r) => r.side === 'L').forEach((r) => { yy += rowText(PAD, yy, r); });
@@ -1604,11 +1725,11 @@
 
     // 推分记录：每条两行。上行 时间 / 难度 / 曲名 / 推分内容；下行 对账号 Rating 的影响 / 单曲 Rating 的变化
     y += 6;
-    sectionTitle(g, '最近的推分', y, '#ffd65a');
+    sectionTitle(g, range ? '推分（' + range.label + '，' + inR.length + ' 次）' : '最近的推分', y, '#ffd65a');
     y += 64;
     if (!recent.length) {
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
-      g.fillText('暂无记录。分数、FC/AJ 标记有提升时会记在这里', PAD, y);
+      g.fillText(range ? '这段时间里没有推分' : '暂无记录。分数、FC/AJ 标记有提升时会记在这里', PAD, y);
     }
     recent.forEach((u) => {
       g.fillStyle = '#ffffff88'; g.font = '14px ' + FONT;
@@ -1629,6 +1750,10 @@
       g.fillStyle = 'rgba(255,255,255,0.06)'; g.fillRect(PAD, y + 36, HW - PAD * 2, 1);
       y += PB_ROW;
     });
+    if (recentMore) {
+      g.fillStyle = '#ffffff88'; g.font = '15px ' + FONT;
+      g.fillText('更早的 ' + recentMore + ' 次推分没有列出（可以把时间段选短一点）', PAD, y);
+    }
     const d = new Date();
     g.fillStyle = '#ffffff66'; g.font = '13px ' + FONT;
     g.fillText(fit(g, 'Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
@@ -1636,17 +1761,24 @@
     return cv;
   }
 
-  function drawSongCurve(hist, e, s, player, db) {
+  // range：同 drawTrend。曲线、推分、最近的游玩只看这段时间；BEST / 标记显示现在的
+  function drawSongCurve(hist, e, s, player, db, range) {
+    const inRange = (t) => !range || (t >= range.from && t <= range.to);
     const obs = hist.obs.filter((o) => o.k === e.k).sort(byTime);
-    const plays = obs.filter((o) => o.src === 'p');
+    const plays = obs.filter((o) => o.src === 'p' && inRange(o.t));
     const { state, updates } = derive(hist);
     const impact = accountImpact(hist, updates, db);
-    const mine = updates.filter((u) => u.k === e.k).reverse().slice(0, 12);
+    const mine = updates.filter((u) => u.k === e.k && inRange(u.t)).reverse().slice(0, 12);
     const cur = state[e.k];
-    // 个人最佳的阶梯线
+    // 个人最佳的阶梯线：从这段时间开始时的最佳画起
     const pbPts = [];
     let best = -1;
-    obs.forEach((o) => { if (o.s > best) { best = o.s; pbPts.push([timeMs(o.t), o.s]); } });
+    obs.forEach((o) => {
+      if (o.s <= best) return;
+      best = o.s;
+      if (range && o.t < range.from) pbPts[0] = [timeMs(range.from), o.s];
+      else if (inRange(o.t)) pbPts.push([timeMs(o.t), o.s]);
+    });
     const rows = plays.slice(-15).reverse();
     const ROW = 32, UROW = 58;
     const H = 190 + 420 + 20 + 64 + Math.max(mine.length, 1) * UROW + 20 + 64 + Math.max(rows.length, 1) * ROW + 50;
@@ -1666,7 +1798,7 @@
     stat(g, 'BEST', best > 0 ? best.toLocaleString('en-US') : '-', rx, '#ffd65a', true);
     g.fillStyle = '#ffffff80'; g.font = '14px ' + FONT; g.textAlign = 'right';
     g.fillText([best > 0 ? scoreRank(best) : '', cInfo.c && best > 0 ? '单曲 Rating ' + (centsOf(best, cInfo.c) / 100).toFixed(2) : '',
-      '记录到 ' + plays.length + ' 次游玩'].filter(Boolean).join('　·　'), rx, PAD + 122);
+      (range ? range.label + ' ' : '记录到 ') + plays.length + ' 次游玩'].filter(Boolean).join('　·　'), rx, PAD + 122);
     g.textAlign = 'left';
     g.fillStyle = '#ffffff33'; g.fillRect(PAD, 168, HW - PAD * 2, 2);
 
@@ -1697,7 +1829,7 @@
     y += 64;
     if (!mine.length) {
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
-      g.fillText('还没有这首歌的推分记录', PAD, y);
+      g.fillText(range ? '这段时间里没有这首歌的推分' : '还没有这首歌的推分记录', PAD, y);
     }
     mine.forEach((u) => {
       g.fillStyle = '#ffffff99'; g.font = '15px ' + FONT;
@@ -1717,7 +1849,7 @@
     y += 64;
     if (!rows.length) {
       g.fillStyle = '#ffffff88'; g.font = 'bold 15px ' + FONT;
-      g.fillText('还没有这首歌的プレイ履歴记录（只有成绩扫描的数据）', PAD, y);
+      g.fillText(range ? '这段时间里没有这首歌的游玩记录' : '还没有这首歌的プレイ履歴记录（只有成绩扫描的数据）', PAD, y);
     }
     // 计算每次游玩时的历史最佳，用于显示「刷新了多少」
     const pbAt = new Map();
@@ -1924,4 +2056,6 @@
   function showResult(drawers, name, back) {
     return renderImages(box, drawers, name, { progress: say, back: back || { label: '返回菜单', fn: showMenu } });
   }
+  // 打开书签：先把数据全部读好，再显示菜单
+  start();
 })();
