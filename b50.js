@@ -1553,6 +1553,10 @@
       const st = fromSnap(prev);
       const s0 = sum(st);
       const steps = []; // [{u, res, d}]  d = 50 首合计的变化（0.01 单位）
+      // 后一个快照里在 B50 里 = 这首歌在这一段里**最后一次**推分后在里面。同一首歌在一段里推了好几次时，
+      // 前面几次不一定进了（第一把比 B50 最低的还低，后来推高了才进），只有最后一次一定留下，前面的照常比较
+      const lastPush = new Map();
+      list.forEach((u) => { if (u.changes.some((c) => c.type === 'score')) lastPush.set(u.k, u); });
       list.forEach((u) => {
         if (!constOf(u.k, u.n, u.d, db).c) { steps.push({ u, res: { noConst: true }, d: 0 }); return; }
         if (!u.changes.some((c) => c.type === 'score')) { steps.push({ u, res: { lampOnly: true }, d: 0 }); return; }
@@ -1563,7 +1567,7 @@
         // 后一个快照里有真实的 B50：在里面 → 一定算进去；不在里面（也不在原来的 B50 里）→ 没进，账号 Rating 不变
         const inNext = next ? (nextBest.has(u.k) || nextNew.has(u.k)) : null;
         if (inNext === false && !st[frame].has(u.k)) Object.assign(res, { entered: false, inFrame: false });
-        else Object.assign(res, put(st[frame], u.k, cents(u.k, u.n, u.after.s), frame === 'best' ? 30 : 20, inNext === true));
+        else Object.assign(res, put(st[frame], u.k, cents(u.k, u.n, u.after.s), frame === 'best' ? 30 : 20, inNext === true && lastPush.get(u.k) === u));
         steps.push({ u, res, d: sum(st) - before });
       });
       // 起点：按定数表算的合计减去偏差（见上面 offsetOf），保证 floor(起点/50) = 前一个快照的游戏 Rating。
