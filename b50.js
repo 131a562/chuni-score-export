@@ -7,7 +7,11 @@
   // 打开书签时读到的数据 { player, best, news, all, db, at }（见「读取」）。fail() 一开始就可能用到，所以放在最前面
   let DATA = null;
   const TEST_DB = (TEST && TEST.db) || { byId: new Map(), byTitle: new Map(), byImage: new Map() };
-  const CONST_URL = 'https://raw.githubusercontent.com/zvuc/otoge-db/master/chunithm/data/music-ex.json';
+  // 定数表：先读 SBGA TOOL 每天整理的那份（格式和 otoge-db 一样，定数和 SBGA TOOL / 查分面板统一），读不到时退回 otoge-db
+  const CONST_URLS = [
+    'https://131a562.github.io/sbga-tool/data/feed/chunithm-music-ex.json',
+    'https://raw.githubusercontent.com/zvuc/otoge-db/master/chunithm/data/music-ex.json',
+  ];
   const HOST = location.hostname;
   const BASE = HOST === 'chunithm-net-eng.com'
     ? 'https://chunithm-net-eng.com/mobile/'
@@ -249,8 +253,18 @@
   let constDb = null;
   const loadConstDb = async () => {
     if (constDb) return constDb;
-    say('正在下载谱面定数表（otoge-db，约 3MB）…');
-    const db = await fetch(CONST_URL).then((r) => { if (!r.ok) throw new Error('定数表下载失败 ' + r.status); return r.json(); });
+    say('正在下载谱面定数表（约 3MB）…');
+    let db = null, lastErr = null;
+    for (const url of CONST_URLS) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('定数表下载失败 ' + r.status);
+        db = await r.json();
+        if (Array.isArray(db) && db.length > 100) break;
+        db = null;
+      } catch (e) { lastErr = e; }
+    }
+    if (!db) throw lastErr || new Error('定数表下载失败');
     const group = (key) => {
       const map = new Map();
       db.forEach((m) => { const k = key(m); if (k) { if (!map.has(k)) map.set(k, []); map.get(k).push(m); } });
@@ -375,7 +389,8 @@
     else if (s >= 800000) r = (c - 5) / 2 + (s - 800000) * ((c - 5) / 2) / 100000;
     else if (s >= 500000) r = ((c - 5) / 2) * (s - 500000) / 300000;
     else r = 0;
-    return Math.max(0, Math.floor(r * 10000 + 1e-6) / 10000);
+    // 単曲レートは 0.01 未満切り捨て。0.0001 単位のまま平均すると、プレイヤーの実際の Rating（10 回分）のうち 2 回が 0.01 ずれた
+    return Math.max(0, Math.floor(r * 100 + 1e-6) / 100);
   };
 
   const scoreRank = (s) => [
@@ -681,7 +696,7 @@
       };
       const snap = {
         t,
-        r: parseFloat(player.rating) || Math.floor((sum(best) + sum(news)) / 50 * 100) / 100,
+        r: parseFloat(player.rating) || Math.floor((sum(best) + sum(news)) / 50 * 100 + 1e-6) / 100,
         b30: best.length ? Math.round(sum(best) / best.length * 10000) / 10000 : 0,
         n20: news.length ? Math.round(sum(news) / news.length * 10000) / 10000 : 0,
         best: best.map(row),
