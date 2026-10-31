@@ -33,6 +33,9 @@
   // 书签请求的 /users/<玩家名> 会被当作 /chunithm/<玩家名>，chuni-sync 时代存在 users/ 下的记录也会自动读到
   // 测试模式只用 TEST.syncUrl（未指定则不同步），避免测试数据写进真实的同步服务
   const SYNC_URL = TEST ? (TEST.syncUrl || '') : 'https://otoge-sync.131a562-index01.workers.dev';
+  // 图片样式（draw-chunithm.js）和读写同步服务的代码（sync.js）放在 SBGA DASHBOARD，三个书签和面板共用，书签运行时加载。
+  // 测试时用 TEST.dashSrc 指到本地的 otoge-dashboard/src/
+  const DASH_SRC = (TEST && TEST.dashSrc) || 'https://131a562.github.io/sbga-dashboard/src/';
 
   if (document.getElementById('b50-overlay')) document.getElementById('b50-overlay').remove();
 
@@ -393,11 +396,6 @@
     return Math.max(0, Math.floor(r * 100 + 1e-6) / 100);
   };
 
-  const scoreRank = (s) => [
-    [1009000, 'SSS+'], [1007500, 'SSS'], [1005000, 'SS+'], [1000000, 'SS'], [990000, 'S+'], [975000, 'S'],
-    [950000, 'AAA'], [925000, 'AA'], [900000, 'A'], [800000, 'BBB'], [700000, 'BB'], [600000, 'B'], [500000, 'C'],
-  ].find(([b]) => s >= b)?.[1] || 'D';
-
   const floor2 = (x) => (Math.floor(x * 100 + 1e-6) / 100).toFixed(2);
 
   // ---------- B50 ----------
@@ -728,70 +726,24 @@
 
   // ---- 同步（经由 otoge-sync 读写 GitHub 私有仓库 otoge-history 的 chunithm/<玩家名>.json）----
   // 「玩家名」= 同步时存入的名字，默认是 CHUNITHM 的玩家名；同一个人换设备时填相同的名字即可接着同步
-  // 统一写法，避免同一个名字因输入方式不同存成两个文件：
-  // NFKC 把全角英数字/符号/空格转成半角、半角片假名转成全角；英文字母统一大写（CHUNITHM 玩家名本来就是大写）
-  const cleanAccount = (s) => s.normalize('NFKC').replace(/[a-z]/g, (c) => c.toUpperCase()).trim()
-    .replace(/[\\/:*?"<>|#%\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').replace(/^\.+/, '').slice(0, 40);
-  // 2026/10/15 的版本没有做上面的统一，名字按原样（多为全角）保存。用于把那时的文件合并过来
-  const legacyAccount = (s) => s.trim().replace(/[\\/:*?"<>|#%\u0000-\u001f]+/g, '_').replace(/\s+/g, ' ').replace(/^\.+/, '').slice(0, 40);
-  const b64enc = (str) => {
-    const bytes = new TextEncoder().encode(str);
-    let bin = '';
-    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    return btoa(bin);
-  };
-  const b64dec = (b64) => {
-    const bin = atob(b64.replace(/\s/g, ''));
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return new TextDecoder().decode(bytes);
-  };
-  const syncFetch = async (acc, suffix, init) => {
-    let res;
-    try {
-      res = await fetch(SYNC_URL.replace(/\/+$/, '') + '/chunithm/' + encodeURIComponent(acc) + (suffix || ''), Object.assign({ cache: 'no-store' }, init));
-    } catch (e) { throw new Error('连不上同步服务'); }
-    if (res.status === 401 || res.status === 403 || res.status >= 500) {
-      throw new Error('同步服务出错（HTTP ' + res.status + '），请联系书签提供者');
-    }
-    return res;
-  };
-  const syncGet = async (acc) => {
-    const res = await syncFetch(acc);
-    if (res.status === 404) return { data: null, sha: null };
-    if (!res.ok) throw new Error('读取失败 HTTP ' + res.status);
-    const j = await res.json();
-    let text;
-    if (j.encoding === 'base64' && j.content) text = b64dec(j.content);
-    else {
-      // 超过 1MB 时 GitHub 不在 JSON 里返回内容，改为读取原始文件
-      const raw = await syncFetch(acc, '/raw');
-      if (!raw.ok) throw new Error('读取失败 HTTP ' + raw.status);
-      text = await raw.text();
-    }
-    try { return { data: JSON.parse(text), sha: j.sha }; } catch (e) { throw new Error('云端数据损坏'); }
-  };
-  const syncPut = async (acc, data, sha) => {
-    const body = { message: 'update ' + acc + ' ' + nowStr(), content: b64enc(JSON.stringify(data)) };
-    if (sha) body.sha = sha;
-    const res = await syncFetch(acc, '', { method: 'PUT', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
-    if (res.status === 409 || res.status === 422) return false;
-    if (!res.ok) throw new Error('写入失败 HTTP ' + res.status);
-    return true;
-  };
-  const syncMerge = async (acc, local) => {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const { data, sha } = await syncGet(acc);
-      // 云端是旧版本（没有起点）的记录：先按起点转换再合并
-      // 云端有文件但不是历史记录的格式：不覆盖，报错（避免用本机数据把云端冲掉）
-      if (data && !data.obs) throw new Error('云端数据格式不对，没有改动云端');
-      const merged = data ? mergeHist(migrateHist(data), local) : local;
-      if (data && JSON.stringify(data) === JSON.stringify(merged)) return merged;
-      // 写入冲突（别的设备刚好也在写）时重新读取再合并
-      if (await syncPut(acc, merged, sha)) return merged;
-    }
-    throw new Error('多次写入冲突，请稍后再试');
-  };
+  // 读写 otoge-sync 的代码（名字的统一写法 cleanAccount、base64、读取 / 写入 / 合并）三个书签共用一份：sbga-dashboard 的 src/sync.js。
+  // recordAndSync 开头加载（loadSync()），之后下面这些名字就是那个模块里的函数。
+  // cleanAccount：NFKC 把全角英数字/符号/空格转成半角、英文字母统一大写，避免同一个名字因输入方式不同存成两个文件；
+  // legacyAccount：2026/10/15 的版本没有做这个统一，名字按原样（多为全角）保存，用于把那时的文件合并过来
+  const SYNC_JS_URL = DASH_SRC + 'sync.js';
+  let cleanAccount, legacyAccount, b64enc, b64dec, syncFetch, syncGet, syncPut, syncMerge;
+  let syncLoading = null;
+  const loadSync = () => syncLoading || (syncLoading = import(SYNC_JS_URL + '?t=' + Date.now()).then((m) => {
+    ({ cleanAccount, legacyAccount, b64enc, b64dec } = m);
+    // 云端有文件但不是历史记录的格式：不覆盖，报错（避免用本机数据把云端冲掉）；云端是旧版本（没有起点）的记录：先按起点转换再合并
+    ({ fetch: syncFetch, get: syncGet, put: syncPut, merge: syncMerge } = m.createSync(SYNC_URL, 'chunithm', (data, local) => {
+      if (!data.obs) throw new Error('云端数据格式不对，没有改动云端');
+      return mergeHist(migrateHist(data), local);
+    }));
+  }, (e) => {
+    syncLoading = null; // 下次再试
+    throw new Error('读不到同步程序（SBGA DASHBOARD 的 sync.js）：' + (e && e.message));
+  }));
 
   // 询问这个 CHUNITHM 玩家的记录要存到哪个名字下。返回名字；选「暂不同步」返回 null
   const askAccount = (player) => new Promise((resolve) => {
@@ -882,6 +834,7 @@
     if (SYNC_URL) {
       acc = opts.forceAsk ? undefined : accounts[player.name];
       try {
+        await loadSync();
         if (acc === undefined) {
           await syncFetch('_ping'); // 先确认连得上，连不上就不询问（错误会显示在结果页 / 历史页）
           acc = await askAccount(player);
@@ -970,7 +923,13 @@
     f.appendChild(back);
   }
 
-  if (TEST) window.__B50_INTERNAL__ = { parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, b64enc, b64dec, syncMerge, syncGet, accountImpact, songRating, loadConstDb, resolveChart, fixPlayKeys };
+  // b64enc 等来自 sync.js，要先 await loadSync()
+  if (TEST) {
+    window.__B50_INTERNAL__ = {
+      parsePlaylog, derive, mergeHist, migrateHist, applyUpdate, accountImpact, songRating, loadConstDb, resolveChart, fixPlayKeys, loadSync,
+      get b64enc() { return b64enc; }, get b64dec() { return b64dec; }, get syncMerge() { return syncMerge; }, get syncGet() { return syncGet; },
+    };
+  }
 
   // 打开プレイ履歴第一条的「詳細を見る」，返回页面主要内容（打码后）。看游玩详情上有没有游玩后的 Rating
   async function readPlaylogDetailSample() {
@@ -1245,85 +1204,31 @@
   const signed = (x, digits) => (x >= 0 ? '+' : '−') + Math.abs(x).toFixed(digits == null ? 2 : digits);
 
   // ---------- 绘制 ----------
-  const COLS = 5, CW = 296, CH = 112, GAP = 12, PAD = 32;
-  const W = PAD * 2 + COLS * CW + (COLS - 1) * GAP;
-  const rows = (n) => Math.ceil(n / COLS);
+  // 图片的底色、标题、统计数字和曲目卡片和 SBGA DASHBOARD 共用一份：DASH_SRC 的 draw-chunithm.js（改样式只改那边）。
+  // 第一次画图时加载（renderImages 开头的 loadDraw()），之后下面这些名字就是那个模块里的尺寸和函数
+  const DRAW_URL = DASH_SRC + 'draw-chunithm.js';
+  let COLS, CW, CH, GAP, PAD, W, rows, newCanvas, header, stat, sectionTitle, card, round, fit, scoreRank, drawB50Image;
+  let drawLoading = null;
+  const loadDraw = () => drawLoading || (drawLoading = import(DRAW_URL + '?t=' + Date.now()).then((m) => {
+    ({ COLS, CW, CH, GAP, PAD, W, rows, newCanvas, header, stat, sectionTitle, card, round, fit, scoreRank } = m);
+    drawB50Image = m.drawB50;
+  }, (e) => {
+    drawLoading = null; // 下次画图时再试
+    throw new Error('读不到图片样式（SBGA DASHBOARD 的 draw-chunithm.js）：' + (e && e.message));
+  }));
 
-  function newCanvas(h, w) {
-    w = w || W;
-    const cv = document.createElement('canvas');
-    cv.width = w; cv.height = h;
-    const g = cv.getContext('2d');
-    if (!g) throw new Error('浏览器无法创建这么大的图片（' + w + '×' + h + '），请缩小定数范围。');
-    const bg = g.createLinearGradient(0, 0, w, h);
-    bg.addColorStop(0, '#141a33'); bg.addColorStop(0.55, '#1d1438'); bg.addColorStop(1, '#0d2230');
-    g.fillStyle = bg; g.fillRect(0, 0, w, h);
-    g.globalAlpha = 0.06; g.strokeStyle = '#fff'; g.lineWidth = 1;
-    for (let x = -h; x < w; x += 28) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x + h, h); g.stroke(); }
-    g.globalAlpha = 1;
-    g.textBaseline = 'alphabetic';
-    return { cv, g };
-  }
-
-  function header(g, kicker, name) {
-    g.fillStyle = '#ffffff99'; g.font = '600 20px ' + FONT;
-    g.fillText(kicker, PAD, PAD + 22);
-    g.fillStyle = '#fff'; g.font = 'bold 48px ' + FONT;
-    g.fillText(fit(g, name, 620), PAD, PAD + 82);
-  }
-
-  function stat(g, label, val, x, color, big) {
-    g.textAlign = 'right';
-    g.fillStyle = '#ffffff99'; g.font = '600 16px ' + FONT;
-    g.fillText(label, x, PAD + 30);
-    g.fillStyle = color; g.font = 'bold ' + (big ? 56 : 36) + 'px ' + FONT;
-    g.fillText(val, x, PAD + (big ? 88 : 80));
-    g.textAlign = 'left';
-  }
-
-  function sectionTitle(g, label, y, color) {
-    g.fillStyle = color; g.fillRect(PAD, y + 12, 6, 28);
-    g.fillStyle = '#fff'; g.font = 'bold 26px ' + FONT;
-    g.fillText(label, PAD + 16, y + 36);
-  }
-
-  function footer(g, h, extra) {
+  const footText = (extra) => {
     const d = new Date();
+    return 'Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
+      '  ·  data: CHUNITHM-NET / otoge-db  ·  * = 定数未公開（推定）' + (extra || '');
+  };
+  function footer(g, h, extra) {
     g.fillStyle = '#ffffff66'; g.font = '13px ' + FONT;
-    g.fillText('Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
-      '  ·  data: CHUNITHM-NET / otoge-db  ·  * = 定数未公開（推定）' + (extra || ''), PAD, h - 20);
+    g.fillText(footText(extra), PAD, h - 20);
   }
 
   function drawB50(player, best, news) {
-    const HEAD = 190, SEC = 56, FOOT = 50;
-    const H = HEAD + SEC + rows(best.length) * (CH + GAP) + SEC + rows(news.length) * (CH + GAP) + FOOT;
-    const { cv, g } = newCanvas(H);
-    const sum = (l) => l.reduce((a, s) => a + s.rating, 0);
-    const bAvg = best.length ? sum(best) / best.length : 0;
-    const nAvg = news.length ? sum(news) / news.length : 0;
-    const total = (sum(best) + sum(news)) / 50;
-
-    header(g, 'CHUNITHM  RATING  BEST 50', player.name);
-    const rx = W - PAD;
-    stat(g, 'RATING', player.rating || floor2(total), rx, '#ffd65a', true);
-    stat(g, 'NEW 20 AVG', floor2(nAvg), rx - 260, '#7ee0ff');
-    stat(g, 'BEST 30 AVG', floor2(bAvg), rx - 460, '#c9a2ff');
-    g.fillStyle = '#ffffff80'; g.font = '14px ' + FONT; g.textAlign = 'right';
-    g.fillText('计算值 (B30+N20)/50 = ' + floor2(total) + '　·　单曲最高 ' + floor2(Math.max(0, ...[...best, ...news].map((s) => s.rating))), rx, PAD + 122);
-    g.textAlign = 'left';
-    g.fillStyle = '#ffffff33'; g.fillRect(PAD, HEAD - 22, W - PAD * 2, 2);
-
-    let y = HEAD;
-    const section = (label, list, color) => {
-      sectionTitle(g, label, y, color);
-      y += SEC;
-      list.forEach((s, i) => card(g, s, '#' + (i + 1), PAD + (i % COLS) * (CW + GAP), y + Math.floor(i / COLS) * (CH + GAP)));
-      y += rows(list.length) * (CH + GAP);
-    };
-    section('BEST 30', best, '#c9a2ff');
-    section('NEW 20', news, '#7ee0ff');
-    footer(g, H);
-    return cv;
+    return drawB50Image({ name: player.name, rating: player.rating, best, news, footer: footText() });
   }
 
   function drawFilter(player, opt, all, page, pageNo, pageCount, offset) {
@@ -2044,70 +1949,6 @@
     return cv;
   }
 
-  function card(g, s, label, x, y) {
-    const w = CW, h = CH;
-    const d = DIFFS[s.diff] || DIFFS[3];
-    round(g, x, y, w, h, 10);
-    g.fillStyle = 'rgba(255,255,255,0.07)'; g.fill();
-    g.lineWidth = 2; g.strokeStyle = d.key === 'ult' ? '#e8e8e8' : d.color; g.stroke();
-
-    // 曲绘
-    const J = h - 16, jx = x + 8, jy = y + 8;
-    g.save(); round(g, jx, jy, J, J, 6); g.clip();
-    if (s.img) g.drawImage(s.img, jx, jy, J, J);
-    else { g.fillStyle = '#ffffff1a'; g.fillRect(jx, jy, J, J); g.fillStyle = '#ffffff55'; g.font = '12px ' + FONT; g.fillText('NO IMAGE', jx + 18, jy + J / 2 + 4); }
-    g.restore();
-    // 序号
-    g.font = 'bold 13px ' + FONT;
-    const lw = Math.max(34, g.measureText(label).width + 10);
-    g.fillStyle = 'rgba(0,0,0,.7)'; round(g, jx, jy, lw, 20, 5); g.fill();
-    g.fillStyle = '#fff'; g.textAlign = 'center';
-    g.fillText(label, jx + lw / 2, jy + 15); g.textAlign = 'left';
-
-    const tx = jx + J + 10, tw = x + w - tx - 10;
-    g.fillStyle = '#fff'; g.font = 'bold 16px ' + FONT;
-    g.fillText(fit(g, s.title, tw), tx, y + 28);
-
-    // 难度 + 定数徽章
-    const badge = d.short + ' ' + (s.constant ? s.constant.toFixed(1) : '?') + (s.estimated ? '*' : '');
-    g.font = 'bold 13px ' + FONT;
-    const bw = g.measureText(badge).width + 14;
-    round(g, tx, y + 38, bw, 20, 4);
-    g.fillStyle = d.color; g.fill();
-    if (d.key === 'ult') { g.strokeStyle = '#e33'; g.lineWidth = 1.5; g.stroke(); }
-    g.fillStyle = '#fff'; g.fillText(badge, tx + 7, y + 53);
-    const rk = scoreRank(s.score);
-    g.fillStyle = rk.startsWith('SSS') ? '#ffd65a' : rk.startsWith('SS') ? '#ffe9a8' : '#ddd';
-    g.font = 'bold 15px ' + FONT;
-    g.fillText(rk, tx + bw + 8, y + 54);
-    if (s.lamp) {
-      const rw = g.measureText(rk).width;
-      g.fillStyle = s.lamp === 'FC' ? '#7ee0ff' : '#ffb86b';
-      g.font = 'bold 13px ' + FONT;
-      g.fillText(s.lamp, tx + bw + 8 + rw + 8, y + 54);
-    }
-
-    g.fillStyle = '#fff'; g.font = 'bold 22px ' + FONT;
-    g.fillText(s.score.toLocaleString('en-US'), tx, y + h - 16);
-    g.textAlign = 'right';
-    g.fillStyle = '#ffd65a'; g.font = 'bold 20px ' + FONT;
-    g.fillText(floor2(s.rating), x + w - 10, y + h - 16);
-    g.textAlign = 'left';
-  }
-
-  function round(g, x, y, w, h, r) {
-    g.beginPath();
-    g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
-    g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
-  }
-
-  function fit(g, text, max) {
-    if (g.measureText(text).width <= max) return text;
-    let t = text;
-    while (t.length > 1 && g.measureText(t + '…').width > max) t = t.slice(0, -1);
-    return t + '…';
-  }
-
   // 逐张绘制 → 导出为 PNG Blob → 立即释放 canvas，避免 iOS 的 canvas 总内存上限。
   // 画到 target 里（整页时 target = box；历史走势页里是页面中的一块区域）。
   //   opts.progress(text)：进度提示；opts.back：{label, fn} 左下的返回按钮；opts.inline：显示在页面里（提示文字简短，不显示同步状态）
@@ -2120,6 +1961,7 @@
     target._urls = [];
     const results = [];
     let tainted = false;
+    await loadDraw();
     for (let i = 0; i < drawers.length; i++) {
       if (aborted) return;
       progress('正在绘制图片…' + (drawers.length > 1 ? ' ' + (i + 1) + '/' + drawers.length : ''));
