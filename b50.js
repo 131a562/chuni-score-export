@@ -1207,10 +1207,10 @@
   // 图片的底色、标题、统计数字和曲目卡片和 SBGA DASHBOARD 共用一份：DASH_SRC 的 draw-chunithm.js（改样式只改那边）。
   // 第一次画图时加载（renderImages 开头的 loadDraw()），之后下面这些名字就是那个模块里的尺寸和函数
   const DRAW_URL = DASH_SRC + 'draw-chunithm.js';
-  let COLS, CW, CH, GAP, PAD, W, rows, newCanvas, header, stat, sectionTitle, card, round, fit, scoreRank, drawB50Image;
+  let COLS, CW, CH, GAP, PAD, W, rows, newCanvas, header, stat, sectionTitle, card, diffBadge, round, fit, scoreRank, drawB50Image;
   let drawLoading = null;
   const loadDraw = () => drawLoading || (drawLoading = import(DRAW_URL + '?t=' + Date.now()).then((m) => {
-    ({ COLS, CW, CH, GAP, PAD, W, rows, newCanvas, header, stat, sectionTitle, card, round, fit, scoreRank } = m);
+    ({ COLS, CW, CH, GAP, PAD, W, rows, newCanvas, header, stat, sectionTitle, card, diffBadge, round, fit, scoreRank } = m);
     drawB50Image = m.drawB50;
   }, (e) => {
     drawLoading = null; // 下次画图时再试
@@ -1237,7 +1237,8 @@
     const groups = [];
     if (opt.sort === 'const') {
       page.forEach((s) => {
-        const k = s.constant.toFixed(1) + (s.estimated ? '*' : '');
+        // 定数未公开（按等级估算）的按等级分组：「14+ 定数未公开」
+        const k = s.estimated ? Math.floor(s.constant) + (s.constant % 1 >= 0.5 ? '+' : '') + ' 定数未公开' : s.constant.toFixed(1);
         if (!groups.length || groups[groups.length - 1].key !== k) groups.push({ key: k, list: [] });
         groups[groups.length - 1].list.push(s);
       });
@@ -1340,17 +1341,6 @@
       g.fillText(s.label, lx + 24, y + h - 15);
       lx += 40 + g.measureText(s.label).width;
     });
-  }
-
-  function diffBadge(g, d, x, y, extra) {
-    const dd = DIFFS[d] || DIFFS[3];
-    const label = dd.short + (extra ? ' ' + extra : '');
-    g.font = 'bold 13px ' + FONT;
-    const bw = g.measureText(label).width + 12;
-    round(g, x, y - 15, bw, 20, 4); g.fillStyle = dd.color; g.fill();
-    if (dd.key === 'ult') { g.strokeStyle = '#e33'; g.lineWidth = 1.5; g.stroke(); }
-    g.fillStyle = '#fff'; g.fillText(label, x + 6, y);
-    return bw;
   }
 
   // 某首歌（观测记录的 k / 曲名 / 难度）的定数，查不到时 c = 0
@@ -1854,7 +1844,7 @@
     g.fillText('CHUNITHM  SCORE HISTORY  ·  ' + (player.name || hist.name), tx, PAD + 20);
     g.fillStyle = '#fff'; g.font = 'bold 38px ' + FONT;
     g.fillText(fit(g, e.n, HW - tx - 300), tx, PAD + 68);
-    let px = tx + diffBadge(g, e.d, tx, PAD + 106, s.constant ? s.constant.toFixed(1) + (s.estimated ? '*' : '') : '') + 8;
+    let px = tx + diffBadge(g, e.d, tx, PAD + 106, s.constant || 0, s.estimated) + 8;
     if (cur && cur.l) px += pill(g, cur.l, px, PAD + 106, LAMP_COLOR[cur.l]) + 6;
     const rx = HW - PAD;
     stat(g, 'BEST', best > 0 ? best.toLocaleString('en-US') : '-', rx, '#ffd65a', true);
