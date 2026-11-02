@@ -1220,7 +1220,7 @@
   const footText = (extra) => {
     const d = new Date();
     return 'Generated ' + d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() +
-      '  ·  data: CHUNITHM-NET / otoge-db  ·  * = 定数未公開（推定）' + (extra || '');
+      '  ·  data: CHUNITHM-NET / otoge-db  ·  定数为 ".?" 的还未公开（按等级估算）' + (extra || '');
   };
   function footer(g, h, extra) {
     g.fillStyle = '#ffffff66'; g.font = '13px ' + FONT;
